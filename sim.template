@@ -1,0 +1,96 @@
+record (ao, "$(P):DAC")
+{
+    field (DTYP, "regDev")
+    field (OUT,  "@$(DEV)/0x00 T=UINT16")
+    field (LINR, "LINEAR")
+    field (LOPR, "-10")
+    field (HOPR, "+10")
+    field (PREC, "3")
+    field (EGU,  "V")
+}
+record (ai, "$(P):ADC")
+{
+    field (DTYP, "regDev")
+    field (INP,  "@$(DEV)/0x00 T=WORD")
+    field (LINR, "LINEAR")
+    field (LOPR, "-10")
+    field (HOPR, "+10")
+    field (PREC, "3")
+    field (EGU,  "V")
+    field (SCAN, ".1 second")
+}
+record (mbbo, "$(P):FLAGS")
+{
+    field (DTYP, "regDev")
+    field (OUT,  "@$(DEV)/0x02 T=USHORT")
+}
+record (mbbi, "$(P):STATUS")
+{
+    field (DTYP, "regDev")
+    field (INP,  "@$(DEV)/0x02 T=UINT16")
+    field (SCAN, ".1 second")
+}
+record (longout, "$(P):LOUT")
+{
+    field (DTYP, "regDev")
+    field (OUT,  "@$(DEV)/0x04 T=LONG")
+}
+record (longin, "$(P):LIN")
+{
+    field (DTYP, "regDev")
+    field (INP,  "@$(DEV)/0x04 T=INT32")
+}
+record (ao, "$(P):FOUT")
+{
+    field (DTYP, "regDev")
+    field (OUT,  "@$(DEV)/0x08 T=FLOAT")
+    field (PREC, "3")
+    field (EGU,  "V")
+}
+record (ai, "$(P):FIN")
+{
+    field (DTYP, "regDev")
+    field (INP,  "@$(DEV)/0x08 T=FLOAT32")
+    field (PREC, "3")
+    field (EGU,  "V")
+    field (SCAN, ".1 second")
+}
+record (ao, "$(P):DOUT")
+{
+    field (DTYP, "regDev")
+    field (OUT,  "@$(DEV)/0x10 T=DOUBLE")
+    field (PREC, "3")
+    field (EGU,  "V")
+}
+record (ai, "$(P):DIN")
+{
+    field (DTYP, "regDev")
+    field (INP,  "@$(DEV)/0x10 T=FLOAT64")
+    field (PREC, "3")
+    field (EGU,  "V")
+    field (SCAN, ".1 second")
+}
+record (waveform, "$(P):WF8")
+{
+    field (DTYP, "regDev")
+    field (INP,  "@$(DEV)/0x0")
+    field (FTVL, "CHAR")
+    field (NELM, "1024")
+    field (SCAN, ".1 second")
+}
+record (waveform, "$(P):WF16")
+{
+    field (DTYP, "regDev")
+    field (INP,  "@$(DEV)/0x0")
+    field (FTVL, "SHORT")
+    field (NELM, "512")
+    field (SCAN, ".1 second")
+}
+record (waveform, "$(P):WF32")
+{
+    field (DTYP, "regDev")
+    field (INP,  "@$(DEV)/0x0")
+    field (FTVL, "LONG")
+    field (NELM, "128")
+    field (SCAN, ".1 second")
+}

@@ -11,17 +11,21 @@
 #ifdef __unix
 #include <sys/mman.h>
 #define HAVE_MMAP
-#endif
+#endif /*__unix */
 
 #ifdef __vxworks
 #include <sysLib.h>
 #include <intLib.h>
 #include <wdLib.h>
+#define HAVE_VME
 #include <vme.h>
 #include <iv.h>
+#include <version.h>
+#ifdef RUNTIME_VERSION /* VxWorks 5.5+ */
+#define HAVE_DMA
 #include <dmaLib.h>
-#define HAVE_VME
-#endif
+#endif /* VxWorks 5.5+ */
+#endif /* __vxworks */
 
 #ifdef EPICS_3_14
 #include <epicsExit.h>
@@ -41,6 +45,9 @@
 
 #define MAGIC 2661166104U /* crc("mmap") */
 
+static char cvsid_mmapDrv[] __attribute__((unused)) =
+    "$Id: mmapDrv.c,v 1.2 2009/12/10 10:05:42 zimoch Exp $";
+
 struct regDevice {
     unsigned long magic;
     const char* name;
@@ -56,7 +63,7 @@ struct regDevice {
     IOSCANPVT ioscanpvt;
     int intrcount;
     int flags;
-#ifdef __vxworks
+#ifdef HAVE_DMA
     SEM_ID dmaComplete;
     WDOG_ID dmaWatchdog;
 #endif
@@ -100,7 +107,7 @@ IOSCANPVT mmapGetInScanPvt(
 
 #define mmapGetOutScanPvt mmapGetInScanPvt
 
-#ifdef __vxworks
+#ifdef HAVE_DMA
 void mmapCancelDma(int handle)
 {
     dmaRequestCancel(handle, FALSE);
@@ -141,7 +148,7 @@ int mmapRead(
     
     LOCK(device->accessLock);
     src = device->localbaseaddress+offset;
-#ifdef __vxworks
+#ifdef HAVE_DMA
     /* Try block transfer for long arrays */
     if (nelem >= 1024 &&                          /* inefficient for short arrays */
         (device->flags & ALLOW_BLOCK_TRANSFER) && /* card must be able to do block transfer */
@@ -214,11 +221,10 @@ int mmapRead(
                     dmaStatus == DMA_CPUERR ? "pci" : 
                     dmaStatus == DMA_STOP   ? "timeout" : "unknown",
                     dmaStatus);
-            /*device->flags &= ~ALLOW_BLOCK_TRANSFER;*/
         }
     }
 noDma:    
-#endif    
+#endif /* HAVE_DMA */ 
     if (mmapDebug >= 1) printf ("mmapRead %s: normal transfer from %p to %p, %d * %d bit\n",
         device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
     switch (dlen)
@@ -563,7 +569,7 @@ int mmapConfigure(
             }
         }
 #endif
-#ifdef __vxworks
+#ifdef HAVE_VME
         case 16:
             addressModifier = VME_AM_USR_SHORT_IO;
             break;
@@ -634,10 +640,12 @@ int mmapConfigure(
     device->intrcount = 0;
     device->flags = addrspace/100 ? ALLOW_BLOCK_TRANSFER : 0;
     
-#ifdef __vxworks
+#ifdef HAVE_DMA
     device->dmaComplete = semBCreate(SEM_Q_FIFO, SEM_EMPTY);
     device->dmaWatchdog = wdCreate();
+#endif /* HAVE_DMA */
 
+#ifdef __vxworks
     if (intrvector)
     {
         if (intConnect(INUM_TO_IVEC(intrvector), mmapInterrupt, (int)device) != OK)
@@ -656,7 +664,7 @@ int mmapConfigure(
         }
         scanIoInit(&device->ioscanpvt);
     }
-#endif
+#endif /* __vxworks */
     regDevRegisterDevice(name, &mmapSupport, device);
     return 0;
 }

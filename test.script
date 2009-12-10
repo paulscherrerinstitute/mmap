@@ -1,4 +1,2 @@
-require mmap,test
 mmapConfigure "sim",0,1024,-1
 dbLoadRecords "sim.template","P=DZ,DEV=sim"
-

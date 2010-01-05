@@ -38,7 +38,7 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.3 2010/01/05 12:46:29 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.4 2010/01/05 12:51:32 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -229,6 +229,8 @@ int mmapWrite(
     void* pmask,
     int prio)
 {    
+    char* dst;
+
     if (!device || device->magic != MAGIC)
     {
         errlogSevPrintf(errlogMajor,
@@ -244,133 +246,10 @@ int mmapWrite(
     }
     if (!device || device->magic != MAGIC
         || offset+dlen*nelem > device->size) return -1;
-    if (mmapDebug >= 1) printf ("mmapWrite %08x:", device->baseaddress+offset);
-    switch (dlen)
-    {
-        case 0:
-            break;
-        case 1:
-        {
-            unsigned char  x;
-            unsigned char* s = pdata;
-            unsigned char* d = (unsigned char*)(device->localbaseaddress+offset);
-            if (pmask)
-            {
-                unsigned char  m = *(unsigned char*)pmask;
-                while (nelem--)
-                {
-                    x = (*s++ & m) | (*d & ~m);
-                    *d++ = x;
-                }
-            }
-            else
-            {
-                while (nelem--)
-                    *d++ = *s++;
-            }
-            break;
-        }
-        case 2:
-        {
-            unsigned short  x;
-            unsigned short* s = pdata;
-            unsigned short* d = (unsigned short*)(device->localbaseaddress+offset);
-            if (pmask)
-            {
-                unsigned short  m = *(unsigned short*)pmask;
-                while (nelem--)
-                {
-                    x = (*s++ & m) | (*d & ~m);
-                    *d++ = x;
-                }
-            }
-            else
-            {
-                while (nelem--)
-                    *d++ = *s++;
-            }
-            break;
-        }
-        case 4:
-        {
-            unsigned long  x;
-            unsigned long* s = pdata;
-            unsigned long* d = (unsigned long*)(device->localbaseaddress+offset);
-            if (pmask)
-            {
-                unsigned long  m = *(unsigned long*)pmask;
-                while (nelem--)
-                {
-                    x = (*s++ & m) | (*d & ~m);
-                    *d++ = x;
-                }
-            }
-            else
-            {
-                while (nelem--)
-                    *d++ = *s++;
-            }
-            break;
-        }
-        case 8:
-        {
-            unsigned long long  x;
-            unsigned long long* s = pdata;
-            unsigned long long* d = (unsigned long long*)(device->localbaseaddress+offset);
-            if (pmask)
-            {
-                unsigned long long  m = *(unsigned long long*)pmask;
-                while (nelem--)
-                {
-                    x = (*s++ & m) | (*d & ~m);
-                    *d++ = x;
-                }
-            }
-            else
-            {
-                while (nelem--)
-                    *d++ = *s++;
-            }
-            break;
-        }
-        default:
-        {
-            unsigned char  x;
-            unsigned char* s = pdata;
-            unsigned char* d = (unsigned char*)(device->localbaseaddress+offset);
-            unsigned char* m;
-            int i;
-            
-            if (pmask)
-            {
-                while (nelem--)
-                {
-                    m = pmask;
-                    if (mmapDebug >= 2) printf (" ");
-                    for (i=0; i<dlen; i++)
-                    {
-                        x = *s++;
-                        x &= *m;
-                        x |= *d & ~*m++;
-                        *d++ = x;
-                    }
-                }
-            }
-            else
-            {
-                while (nelem--)
-                {
-                    m = pmask;
-                    if (mmapDebug >= 2) printf (" ");
-                    for (i=0; i<dlen; i++)
-                    {
-                        *d++ = *s++;
-                    }
-                }
-            }
-        }
-    }
-    if (mmapDebug >= 2) printf ("\n");
+    dst = device->localbaseaddress+offset;
+    if (mmapDebug >= 1) printf ("mmapWrite %s: transfer from %p to %p, %d * %d bit\n",
+        device->name, pdata, dst, nelem, dlen*8);
+    regDevCopy(dlen, nelem, pdata, dst, NULL, 0);
     return 0;
 }
 

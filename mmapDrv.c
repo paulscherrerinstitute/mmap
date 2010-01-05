@@ -31,27 +31,18 @@
 #include <epicsExit.h>
 #include <epicsMutex.h>
 #include <epicsExport.h>
-#define MUTEX epicsMutexId
-#define MUTEX_CREATE() epicsMutexCreate()
-#define LOCK(m) epicsMutexLock(m)
-#define UNLOCK(m) epicsMutexUnlock(m)
 #else
 #include <semLib.h>
-#define MUTEX SEM_ID
-#define MUTEX_CREATE() semMCreate(SEM_Q_FIFO)
-#define LOCK(m) semTake(m, WAIT_FOREVER)
-#define UNLOCK(m) semGive(m)
 #endif
 
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.2 2009/12/10 10:05:42 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.3 2010/01/05 12:46:29 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
     const char* name;
-    MUTEX accessLock;
     char* localbaseaddress;
     int addrspace;
     unsigned int baseaddress;
@@ -146,7 +137,6 @@ int mmapRead(
         return -1;
     }
     
-    LOCK(device->accessLock);
     src = device->localbaseaddress+offset;
 #ifdef HAVE_DMA
     /* Try block transfer for long arrays */
@@ -210,7 +200,6 @@ int mmapRead(
             wdCancel(device->dmaWatchdog);
             if (dmaStatus == DMA_DONE)
             {
-                UNLOCK(device->accessLock);
                 return 0;
             }
             errlogSevPrintf(errlogMajor,
@@ -227,78 +216,7 @@ noDma:
 #endif /* HAVE_DMA */ 
     if (mmapDebug >= 1) printf ("mmapRead %s: normal transfer from %p to %p, %d * %d bit\n",
         device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
-    switch (dlen)
-    {
-        case 0:
-            break;
-        case 1:
-        {
-            unsigned char* s = (unsigned char*)src;
-            unsigned char* d = pdata;
-                
-            while (nelem--)
-                *d++ = *s++;
-            break;
-        }
-        case 2:
-        {
-            unsigned short* s = (unsigned short*)src;
-            unsigned short* d = pdata;
-                
-            while (nelem--)
-                *d++ = *s++;
-            break;
-        }
-        case 4:
-        {
-            unsigned long* s = (unsigned long*)src;
-            unsigned long* d = pdata;
-                
-            while (nelem--)
-                *d++ = *s++;
-            break;
-        }
-        case 8:
-        {
-            unsigned long long* s = (unsigned long long*)src;
-            unsigned long long* d = pdata;
-                
-            while (nelem--)
-                *d++ = *s++;
-            break;
-        }
-        default:
-        {
-            unsigned char* s = (unsigned char*)src;
-            unsigned char* d = pdata;
-            int i;
-            
-            while (nelem--)
-            {
-                i = dlen;
-                while (i)
-                {
-                    if (i>=4 && (((long)s|(long)d)&2)==0)
-                    {
-                        *(unsigned long*)d = *(unsigned long*)s;
-                        d+=4;
-                        s+=4;
-                        i-=4;
-                    } else if (i>=2 && (((long)s|(long)d)&1)==0)
-                    {
-                        *(unsigned short*)d = *(unsigned short*)s;
-                        d+=2;
-                        s+=2;
-                        i-=2;
-                    } else {
-                        *d++ = *s++;
-                        i--;
-                    }
-                }
-            }
-        }
-    }
-    UNLOCK(device->accessLock);
+    regDevCopy(dlen, nelem, src, pdata, NULL, 0);
     return 0;
 }
 
@@ -326,7 +244,6 @@ int mmapWrite(
     }
     if (!device || device->magic != MAGIC
         || offset+dlen*nelem > device->size) return -1;
-    LOCK(device->accessLock);
     if (mmapDebug >= 1) printf ("mmapWrite %08x:", device->baseaddress+offset);
     switch (dlen)
     {
@@ -454,7 +371,6 @@ int mmapWrite(
         }
     }
     if (mmapDebug >= 2) printf ("\n");
-    UNLOCK(device->accessLock);
     return 0;
 }
 
@@ -631,7 +547,6 @@ int mmapConfigure(
     device->addrspace = addrspace%100;
     device->baseaddress = baseaddress;
     device->localbaseaddress = localbaseaddress;
-    device->accessLock = MUTEX_CREATE();
     device->intrlevel = intrlevel;
     device->intrvector = intrvector;
     device->intrhandler = intrhandler;

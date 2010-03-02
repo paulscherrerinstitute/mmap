@@ -35,10 +35,16 @@
 #include <semLib.h>
 #endif
 
+#if defined (__GNUC__) && defined (_ARCH_PPC)
+#define SYNC __asm__("eieio;sync");
+#else
+#define SYNC
+#endif
+
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.4 2010/01/05 12:51:32 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.5 2010/03/02 10:45:06 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -162,13 +168,22 @@ int mmapRead(
                 dataWidth = DT32;
                 break;
             case 8:
-                dataWidth = DT64;
+            {
+                const int dmamodes [] = {DT2eSST320, DT2eSST267, DT2eSST160, DT2eVME, DT64};
+                int i;
+                
+                for (i = 0; i < sizeof(dmamodes)/sizeof(dmamodes[0]); i++)
+                {
+                    dataWidth = dmamodes[i];
+                    if (dmaProtocolSupport(dataWidth) == OK) goto doDma;
+                }
                 break;
+            }
             default:
                 goto noDma;
         }
-        if (mmapDebug >= 1) printf ("mmapRead %s: block transfer from %p to %p, %d * %d bit\n",
-            device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
+        if (dmaProtocolSupport(dataWidth) != OK) goto noDma;
+doDma:
         switch (device->addrspace)
         {
             case 16:
@@ -183,6 +198,8 @@ int mmapRead(
             default:
                 goto noDma;
         }
+        if (mmapDebug >= 1) printf ("mmapRead %s: block transfer from %p to %p, %d * %d bit\n",
+            device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
         if ((dmaHandle = dmaTransferRequest(pdata, (unsigned char*) src, nelem*dlen,
                 addrMode, dataWidth, V2C, 100,
                 (VOIDFUNCPTR)semGive, device->dmaComplete, &dmaStatus)) != ERROR)
@@ -210,6 +227,11 @@ int mmapRead(
                     dmaStatus == DMA_CPUERR ? "pci" : 
                     dmaStatus == DMA_STOP   ? "timeout" : "unknown",
                     dmaStatus);
+        }
+        else
+        {
+            if (mmapDebug >= 1) printf ("mmapRead %s: block transfer mode %x failed\n",
+                device->name, dataWidth);
         }
     }
 noDma:    
@@ -250,6 +272,7 @@ int mmapWrite(
     if (mmapDebug >= 1) printf ("mmapWrite %s: transfer from %p to %p, %d * %d bit\n",
         device->name, pdata, dst, nelem, dlen*8);
     regDevCopy(dlen, nelem, pdata, dst, NULL, 0);
+    SYNC
     return 0;
 }
 
@@ -266,9 +289,7 @@ int mmapIntAckSetBits16(regDevice *device)
     unsigned int offset = (int) device->userdata >> 16;
     unsigned int bits   = (int) device->userdata & 0xFFFF;
     *(epicsInt16*)(device->localbaseaddress+offset) |= bits;
-#if defined (__GNUC__) && defined (_ARCH_PPC)
-    __asm__ volatile ("eieio;sync");
-#endif
+    SYNC
     return 0;
 }
 
@@ -277,9 +298,7 @@ int mmapIntAckClearBits16(regDevice *device)
     unsigned int offset = (int) device->userdata >> 16;
     unsigned int bits   = (int) device->userdata & 0xFFFF;
     *(epicsInt16*)(device->localbaseaddress+offset) &= ~bits;
-#if defined (__GNUC__) && defined (_ARCH_PPC)
-    __asm__ volatile ("eieio;sync");
-#endif
+    SYNC
     return 0;
 }
 

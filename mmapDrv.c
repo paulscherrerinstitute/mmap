@@ -49,7 +49,7 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.7 2013/01/17 13:17:22 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.8 2013/01/17 13:22:01 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -404,8 +404,8 @@ static regDevSupport mmapSupport = {
 
 int mmapIntAckSetBits16(regDevice *device)
 {
-    unsigned int offset = (int) device->userdata >> 16;
-    unsigned int bits   = (int) device->userdata & 0xFFFF;
+    size_t offset = (size_t) device->userdata >> 16;
+    size_t bits   = (size_t) device->userdata & 0xFFFF;
     *(epicsInt16*)(device->localbaseaddress+offset) |= bits;
     SYNC
     return 0;
@@ -413,8 +413,8 @@ int mmapIntAckSetBits16(regDevice *device)
 
 int mmapIntAckClearBits16(regDevice *device)
 {
-    unsigned int offset = (int) device->userdata >> 16;
-    unsigned int bits   = (int) device->userdata & 0xFFFF;
+    size_t offset = (size_t) device->userdata >> 16;
+    size_t bits   = (size_t) device->userdata & 0xFFFF;
     *(epicsInt16*)(device->localbaseaddress+offset) &= ~bits;
     SYNC
     return 0;

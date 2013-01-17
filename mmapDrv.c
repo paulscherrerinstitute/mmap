@@ -17,22 +17,27 @@
 #include <sysLib.h>
 #include <intLib.h>
 #include <wdLib.h>
+#include <semLib.h>
 #define HAVE_VME
 #include <vme.h>
 #include <iv.h>
+#define atVMEA16 VME_AM_USR_SHORT_IO
+#define atVMEA24 VME_AM_STD_SUP_DATA
+#define atVMEA32 VME_AM_EXT_SUP_DATA
 #include <version.h>
 #ifdef RUNTIME_VERSION /* VxWorks 5.5+ */
 #define HAVE_DMA
 #include <dmaLib.h>
 #endif /* VxWorks 5.5+ */
+#else /*__vxworks */
+#include <devLib.h>
 #endif /* __vxworks */
 
 #ifdef EPICS_3_14
+#define HAVE_VME
+#include <epicsTypes.h>
 #include <epicsExit.h>
 #include <epicsMutex.h>
-#include <epicsExport.h>
-#else
-#include <semLib.h>
 #endif
 
 #if defined (__GNUC__) && defined (_ARCH_PPC)
@@ -44,13 +49,13 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.6 2010/03/08 09:34:49 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.7 2013/01/17 13:17:22 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
     const char* name;
-    char* localbaseaddress;
-    int addrspace;
+    volatile char* localbaseaddress;
+    int vmespace;
     unsigned int baseaddress;
     unsigned int size;
     unsigned int intrvector;
@@ -71,6 +76,7 @@ int mmapDebug = 0;
 
 /* Device flags */
 #define ALLOW_BLOCK_TRANSFER 0x0000001
+#define READONLY_DEVICE      0x0000002
 
 /******** Support functions *****************************/ 
 
@@ -123,7 +129,7 @@ int mmapRead(
     void* pdata,
     int prio)
 {
-    char* src;
+    volatile char* src;
 
     if (!device || device->magic != MAGIC)
     {
@@ -177,15 +183,15 @@ int mmapRead(
             default:
                 goto noDmaRead;
         }
-        switch (device->addrspace)
+        switch (device->vmespace)
         {
-            case 16:
+            case atVMEA16:
                 addrMode = AM16;
                 break;
-            case 24:
+            case atVMEA24:
                 addrMode = AM24;
                 break;
-            case 32:
+            case atVMEA32:
                 addrMode = AM32;
                 break;
             default:
@@ -260,12 +266,18 @@ int mmapWrite(
     void* pmask,
     int prio)
 {    
-    char* dst;
+    volatile char* dst;
 
     if (!device || device->magic != MAGIC)
     {
         errlogSevPrintf(errlogMajor,
             "mmapWrite: illegal device handle\n");
+        return -1;
+    }
+    if (device->flags & READONLY_DEVICE)
+    {
+        errlogSevPrintf(errlogMajor,
+            "mmapWrite: device is read-only\n");
         return -1;
     }
     if (offset > device->size ||
@@ -307,16 +319,16 @@ int mmapWrite(
             default:
                 goto noDmaWrite;
         }
-        switch (device->addrspace)
+        switch (device->vmespace)
         {
             case 16:
-                addrMode = AM16;
+                addrMode = atVMEA16;
                 break;
             case 24:
-                addrMode = AM24;
+                addrMode = atVMEA24;
                 break;
             case 32:
-                addrMode = AM32;
+                addrMode = atVMEA32;
                 break;
             default:
                 goto noDmaWrite;
@@ -408,8 +420,9 @@ int mmapIntAckClearBits16(regDevice *device)
     return 0;
 }
 
-void mmapInterrupt(regDevice *device)
+void mmapInterrupt(void *arg)
 {
+    regDevice *device = (regDevice *)arg;
     device->intrcount++;
     if (device->intrhandler)
     {
@@ -424,7 +437,13 @@ int mmapConfigure(
     const char* name,
     unsigned int baseaddress,
     unsigned int size,
+#ifdef __vxworks
     int addrspace,
+#define ADDRSPACEFMT "%d"
+#else
+    char* addrspace,
+#define ADDRSPACEFMT "%s"
+#endif
     unsigned int intrvector,
     unsigned int intrlevel,
     int (*intrhandler)(regDevice *device),
@@ -432,111 +451,127 @@ int mmapConfigure(
 {
     regDevice* device;
     char* localbaseaddress;
-    int addressModifier = 0;
+    int vmespace=0;
+    int flags=0;
 
-    if (name == NULL)
+    if (name == NULL || size == 0)
     {
         printf("usage: mmapConfigure(\"name\", baseaddress, size, addrspace)\n");
         printf("maps register block to device \"name\"");
         printf("\"name\" must be a unique string on this IOC\n");
-        printf("addrspace = -1: simulation on allocated memory\n");
 #ifdef HAVE_MMAP
-        printf("addrspace = 0 (default): physical address space using /dev/mem\n");
+        printf("addrspace: device used for mapping (default: /dev/mem)\n");
 #endif
 #ifdef HAVE_VME
-        printf("addrspace = 16, 24 or 32: VME address space (+100: allow block transfer)\n");
+        printf("addrspace = 16, 24 or 32: VME address space"
+#ifdef HAVE_DMA
+                " (+100: allow block transfer)"
 #endif
+                "\n");
+#endif
+        printf("addrspace = sim: simulation on allocated memory\n");
         return 0;
     }
-    switch (addrspace%100)
+#ifdef HAVE_VME        
+#ifdef __vxworks
+    vmespace = addrspace;
+#else
+    if (!addrspace || !addrspace[0]) { addrspace="/dev/mem"; }
+    if (sscanf (addrspace, "%d", &vmespace) == 1)
+#endif
     {
-        case -1:  /* Simulation runs on allocated memory */
+        flags=vmespace/100;
+        vmespace%=100;
+        switch (vmespace)
         {
-            
-            int i;
-            localbaseaddress = calloc(1, size);
-            if (localbaseaddress == NULL)
-            {
+            case 16:
+                vmespace = atVMEA16;
+                break;
+            case 24:
+                vmespace = atVMEA24;
+                break;
+            case 32:
+                vmespace = atVMEA32;
+                break;
+            default:
                 errlogSevPrintf(errlogFatal,
-                    "mmapConfigure %s: out of memory\n",
-                    name);
-                return errno;
-            }
-            for (i = 0; i < size; i++) localbaseaddress[i] = i;
-            break;
+                    "mmapConfigure %s: illegal VME address space "
+                    ADDRSPACEFMT " must be 16, 24 or 32\n",
+                    name, addrspace);
+                return -1;
         }
-#ifdef HAVE_MMAP
-        case 0: /* map physical address space with mmap() */
+#ifdef __vxworks
+        if (sysBusToLocalAdrs(vmespace, (char*)baseaddress, &localbaseaddress) != OK)
+#else
+        if ((*pdevLibVirtualOS->pDevMapAddr) (vmespace, 0, baseaddress, size, (volatile void **)(volatile char **)&localbaseaddress) != 0)
+#endif /*__vxworks*/
         {
-            int fd;
-            fd = open("/dev/mem", O_RDWR | O_SYNC);
-            if (fd < 0) {
-                errlogSevPrintf(errlogFatal,
-                    "mmapConfigure %s: can't open /dev/mem: %s\n",
-                    name, strerror(errno));
-                return errno;
-            }
+            errlogSevPrintf(errlogFatal,
+                "mmapConfigure %s: can't map address 0x%08x on "
+                ADDRSPACEFMT " address space\n",
+                name, baseaddress, addrspace);
+            return -1;
+        }
+    }
+#endif /*HAVE_VME*/
+    if (vmespace == -1
+#ifndef __vxworks
+        || strcmp(addrspace, "sim") == 0
+#endif
+    )
+    {
+        /* Simulation runs on allocated memory */
+        localbaseaddress = calloc(1, size);
+        if (localbaseaddress == NULL)
+        {
+            errlogSevPrintf(errlogFatal,
+                "mmapConfigure %s: out of memory allocating %d bytes of simulated address space\n",
+                name, size);
+            return errno;
+        }
+    }
+#ifdef HAVE_MMAP
+    else 
+    {
+        int fd;
+
+        fd = open(addrspace, O_RDWR | O_SYNC);
+        if (fd >= 0)
+        {
             localbaseaddress = mmap(NULL, size,
                 PROT_READ|PROT_WRITE, MAP_SHARED,
                 fd, baseaddress);
             close(fd);
-            if (localbaseaddress == MAP_FAILED || localbaseaddress == NULL)
+        }
+        else
+        {
+            flags |= READONLY_DEVICE;
+            fd = open(addrspace, O_RDONLY | O_SYNC);
+            if (fd >= 0)
             {
-                errlogSevPrintf(errlogFatal,
-                    "mmapConfigure %s: can't mmap /dev/mem: %s\n",
-                    name, strerror(errno));
-                return errno;
+                localbaseaddress = mmap(NULL, size,
+                    PROT_READ, MAP_SHARED,
+                    fd, baseaddress);
+                close(fd);
             }
+
         }
-#endif
-#ifdef HAVE_VME
-        case 16:
-            addressModifier = VME_AM_USR_SHORT_IO;
-            break;
-        case 24:
-            addressModifier = VME_AM_STD_SUP_DATA;
-            break;
-        case 32:
-            addressModifier = VME_AM_EXT_SUP_DATA;
-            break;
-#endif
-        default:
+        if (fd < 0)
         {
             errlogSevPrintf(errlogFatal,
-                "mmapConfigure %s: illegal VME address space %d must be 16, 24 or 32\n",
-                name, addrspace);
-            return -1;
+                "mmapConfigure %s: can't open %s: %s\n",
+                name, addrspace, strerror(errno));
+            return errno;
         }
-    }
-#ifdef __vxworks
-    if (sysBusToLocalAdrs(addressModifier, (char*)baseaddress, &localbaseaddress) != OK)
-    {
-        errlogSevPrintf(errlogFatal,
-            "mmapConfigure %s: can't map address 0x%08x on A%d address space\n",
-            name, baseaddress, addrspace);
-        return -1;
-    }
-#endif
-    if (intrvector > 0)
-    {
-        if (addressModifier == 0)
+        if (localbaseaddress == MAP_FAILED || localbaseaddress == NULL)
         {
             errlogSevPrintf(errlogFatal,
-                "mmapConfigure %s: interrupts not supported on addrspace %d\n",
-                name, addrspace);
-            return -1;
+                "mmapConfigure %s: can't mmap %s: %s\n",
+                name, addrspace, strerror(errno));
+            return errno;
         }
-#ifdef HAVE_VME
-        if (intrlevel < 1 || intrlevel > 7)
-        {
-            errlogSevPrintf(errlogFatal, 
-                "mmapConfigure %s: illegal interrupt level %d must be 1...7\n",
-                name, intrlevel);
-            return -1;
-        }
-#endif
     }
-        
+#endif      
     device = (regDevice*)malloc(sizeof(regDevice));
     if (device == NULL)
     {
@@ -548,7 +583,7 @@ int mmapConfigure(
     device->magic = MAGIC;
     device->name = name;
     device->size = size;
-    device->addrspace = addrspace%100;
+    device->vmespace = vmespace;
     device->baseaddress = baseaddress;
     device->localbaseaddress = localbaseaddress;
     device->intrlevel = intrlevel;
@@ -557,7 +592,7 @@ int mmapConfigure(
     device->userdata = userdata;
     device->ioscanpvt = NULL;
     device->intrcount = 0;
-    device->flags = addrspace/100 ? ALLOW_BLOCK_TRANSFER : 0;
+    device->flags = flags;
     
 #ifdef HAVE_DMA
     device->maxDmaSpeed=-1;
@@ -576,17 +611,31 @@ int mmapConfigure(
     device->dmaWatchdog = wdCreate();
 #endif /* HAVE_DMA */
 
-#ifdef __vxworks
     if (intrvector)
     {
-        if (intConnect(INUM_TO_IVEC(intrvector), mmapInterrupt, (int)device) != OK)
+        if (vmespace <= 0)
+        {
+            errlogSevPrintf(errlogFatal,
+                "mmapConfigure %s: interrupts not supported on addrspace " ADDRSPACEFMT "\n",
+                name, addrspace);
+            return -1;
+        }
+        if (intrlevel < 1 || intrlevel > 7)
+        {
+            errlogSevPrintf(errlogFatal, 
+                "mmapConfigure %s: illegal interrupt level %d must be 1...7\n",
+                name, intrlevel);
+            return -1;
+        }
+#ifdef HAVE_VME
+        if (devConnectInterrupt(intVME, intrvector, mmapInterrupt, device) != 0)
         {
             errlogSevPrintf(errlogFatal,
                 "vmemapConfigure %s: cannot connect to interrupt vector %d\n",
                 name, intrvector);
             return -1;
         }
-        if (sysIntEnable(intrlevel) != OK)
+        if (devEnableInterruptLevel(intVME, intrlevel) != 0)
         {
             errlogSevPrintf(errlogFatal,
                 "vmemapConfigure %s: cannot enable interrupt level %d\n",
@@ -594,8 +643,8 @@ int mmapConfigure(
             return -1;
         }
         scanIoInit(&device->ioscanpvt);
+#endif /* HAVE_VME */
     }
-#endif /* __vxworks */
     regDevRegisterDevice(name, &mmapSupport, device);
     return 0;
 }
@@ -606,7 +655,11 @@ int mmapConfigure(
 static const iocshArg mmapConfigureArg0 = { "name", iocshArgString };
 static const iocshArg mmapConfigureArg1 = { "baseaddress", iocshArgInt };
 static const iocshArg mmapConfigureArg2 = { "size", iocshArgInt };
+#ifdef __vxworks
 static const iocshArg mmapConfigureArg3 = { "addrspace (-1=simulation;16,24,32=VME,+100=block transfer)", iocshArgInt };
+#else
+static const iocshArg mmapConfigureArg3 = { "mapped device (sim=simulation, default:/dev/mem)", iocshArgString };
+#endif
 static const iocshArg mmapConfigureArg4 = { "intrvector (default:0)", iocshArgInt };
 static const iocshArg mmapConfigureArg5 = { "intrlevel (default:0)", iocshArgInt };
 static const iocshArg mmapConfigureArg6 = { "intrhandler (default:NULL)", iocshArgString };
@@ -627,10 +680,14 @@ static const iocshFuncDef mmapConfigureDef =
     
 static void mmapConfigureFunc (const iocshArgBuf *args)
 {
-    int status = mmapConfigure(
-        args[0].sval, args[1].ival, args[2].ival, args[3].ival, args[4].ival,
-        args[5].ival, NULL, NULL);
-    if (status != 0) epicsExit(1);
+    mmapConfigure(
+        args[0].sval, args[1].ival, args[2].ival,
+#ifdef __vxworks
+        args[3].ival,
+#else
+        args[3].sval,
+#endif
+        args[4].ival, args[5].ival, NULL, NULL);
 }
 
 static void mmapRegistrar ()

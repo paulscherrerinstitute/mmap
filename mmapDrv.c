@@ -36,8 +36,7 @@
 #ifdef EPICS_3_14
 #define HAVE_VME
 #include <epicsTypes.h>
-#include <epicsExit.h>
-#include <epicsMutex.h>
+#include <epicsThread.h>
 #endif
 
 #if defined (__GNUC__) && defined (_ARCH_PPC)
@@ -49,7 +48,7 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.8 2013/01/17 13:22:01 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.9 2013/03/13 08:23:41 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -534,35 +533,52 @@ int mmapConfigure(
     else 
     {
         int fd;
+        int first = 1;
+        double sleep = 0.1;
 
-        fd = open(addrspace, O_RDWR | O_SYNC);
-        if (fd >= 0)
-        {
-            localbaseaddress = mmap(NULL, size,
-                PROT_READ|PROT_WRITE, MAP_SHARED,
-                fd, baseaddress);
-            close(fd);
-        }
-        else
-        {
-            flags |= READONLY_DEVICE;
-            fd = open(addrspace, O_RDONLY | O_SYNC);
+        do {
+
+            fd = open(addrspace, O_RDWR | O_SYNC);
             if (fd >= 0)
             {
                 localbaseaddress = mmap(NULL, size,
-                    PROT_READ, MAP_SHARED,
+                    PROT_READ|PROT_WRITE, MAP_SHARED,
                     fd, baseaddress);
                 close(fd);
             }
+            else
+            {
+                flags |= READONLY_DEVICE;
+                fd = open(addrspace, O_RDONLY | O_SYNC);
+                if (fd >= 0)
+                {
+                    localbaseaddress = mmap(NULL, size,
+                        PROT_READ, MAP_SHARED,
+                        fd, baseaddress);
+                    close(fd);
+                }
 
-        }
-        if (fd < 0)
-        {
-            errlogSevPrintf(errlogFatal,
-                "mmapConfigure %s: can't open %s: %s\n",
-                name, addrspace, strerror(errno));
-            return errno;
-        }
+            }
+            if (fd < 0)
+            {
+                if (errno != ENOENT)
+                {
+                    errlogSevPrintf(errlogFatal,
+                        "mmapConfigure %s: can't open %s: %s\n",
+                        name, addrspace, strerror(errno));
+                    return errno;
+                }
+                if (first)
+                {
+                    first = 0;
+                    errlogSevPrintf(errlogInfo,
+                        "mmapConfigure %s: can't open %s: %s\nI will retry later...\n",
+                        name, addrspace, strerror(errno));
+                }
+                epicsThreadSleep(sleep);
+                if (sleep < 10) sleep *= 1.1;
+            }
+        } while (fd < 0);
         if (localbaseaddress == MAP_FAILED || localbaseaddress == NULL)
         {
             errlogSevPrintf(errlogFatal,

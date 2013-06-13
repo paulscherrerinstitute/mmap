@@ -48,7 +48,7 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.9 2013/03/13 08:23:41 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.10 2013/06/13 15:50:23 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -97,7 +97,7 @@ void mmapReport(
 
 IOSCANPVT mmapGetInScanPvt(
     regDevice *device,
-    unsigned int offset)
+    size_t offset)
 {
     if (!device || device->magic != MAGIC)
     { 
@@ -122,9 +122,9 @@ void mmapCancelDma(int handle)
 
 int mmapRead(
     regDevice *device,
-    unsigned int offset,
+    size_t offset,
     unsigned int dlen,
-    unsigned int nelem,
+    size_t nelem,
     void* pdata,
     int prio)
 {
@@ -136,21 +136,7 @@ int mmapRead(
             "mmapRead: illegal device handle\n");
         return -1;
     }
-    if (offset > device->size)
-    {
-        errlogSevPrintf(errlogMajor,
-            "mmapRead %s: offset %d out of range (0-%d)\n",
-            device->name, offset, device->size);
-        return -1;
-    }
-    if (offset+dlen*nelem > device->size)
-    {
-        errlogSevPrintf(errlogMajor,
-            "mmapRead %s: offset %d + %d bytes length exceeds mapped size %d by %d bytes\n",
-            device->name, offset, nelem, device->size,
-            offset+dlen*nelem - device->size);
-        return -1;
-    }
+    regDevCheckOffset("mmapRead", device->name, offset, dlen, nelm, device->size);
     
     src = device->localbaseaddress+offset;
 #ifdef HAVE_DMA
@@ -258,9 +244,9 @@ noDmaRead:
 
 int mmapWrite(
     regDevice *device,
-    unsigned int offset,
+    size_t offset,
     unsigned int dlen,
-    unsigned int nelem,
+    size_t nelem,
     void* pdata,
     void* pmask,
     int prio)
@@ -537,10 +523,10 @@ int mmapConfigure(
         double sleep = 0.1;
 
         do {
-
             fd = open(addrspace, O_RDWR | O_SYNC);
             if (fd >= 0)
             {
+                if (sleep > 0.1) epicsThreadSleep(1);
                 localbaseaddress = mmap(NULL, size,
                     PROT_READ|PROT_WRITE, MAP_SHARED,
                     fd, baseaddress);
@@ -552,12 +538,12 @@ int mmapConfigure(
                 fd = open(addrspace, O_RDONLY | O_SYNC);
                 if (fd >= 0)
                 {
+                    if (sleep > 0.1) epicsThreadSleep(1);
                     localbaseaddress = mmap(NULL, size,
                         PROT_READ, MAP_SHARED,
                         fd, baseaddress);
                     close(fd);
                 }
-
             }
             if (fd < 0)
             {

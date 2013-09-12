@@ -48,7 +48,7 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.10 2013/06/13 15:50:23 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.11 2013/09/12 14:54:07 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -67,7 +67,6 @@ struct regDevice {
 #ifdef HAVE_DMA
     int maxDmaSpeed;
     SEM_ID dmaComplete;
-    WDOG_ID dmaWatchdog;
 #endif
 };
 
@@ -90,7 +89,7 @@ void mmapReport(
             device->localbaseaddress+device->size-1);
         if (level > 1)
         {
-            printf("       Interrupt count: %d\n", device->intrcount);
+            printf("  Interrupt count: %d\n", device->intrcount);
         }
     }
 }
@@ -190,17 +189,14 @@ int mmapRead(
                     addrMode, dataWidth, V2C, 100,
                     (VOIDFUNCPTR)semGive, device->dmaComplete, &dmaStatus)) != ERROR)
             {
-                wdStart(device->dmaWatchdog, sysClkRateGet(), (FUNCPTR)mmapCancelDma, dmaHandle);
-                if (semTake(device->dmaComplete, 10*sysClkRateGet()) == ERROR)
+                if (semTake(device->dmaComplete, sysClkRateGet()) == ERROR)
                 {
-                    wdCancel(device->dmaWatchdog);
                     dmaRequestCancel(dmaHandle, TRUE);
                     errlogSevPrintf(errlogMajor,
                         "mmapRead %s: DMA transfer timeout.\n",
                             device->name);
                     return ERROR;
                 }
-                wdCancel(device->dmaWatchdog);
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
                     /* try again with a slower DMA speed */
@@ -277,7 +273,8 @@ int mmapWrite(
     dst = device->localbaseaddress+offset;
 #ifdef HAVE_DMA
     /* Try block transfer for long arrays */
-    if (nelem >= 1024 &&                          /* inefficient for short arrays */
+    if (pmask == NULL &&                           /* cannot use read-modify-write with DMA */
+        nelem >= 1024 &&                          /* inefficient for short arrays */
         (device->flags & ALLOW_BLOCK_TRANSFER) && /* card must be able to do block transfer */
         (((long)pdata|(long)dst) & 0x7) == 0)     /* src and dst address must be multiple of 8 */
     {
@@ -326,17 +323,14 @@ int mmapWrite(
                     addrMode, dataWidth, C2V, 100,
                     (VOIDFUNCPTR)semGive, device->dmaComplete, &dmaStatus)) != ERROR)
             {
-                wdStart(device->dmaWatchdog, sysClkRateGet(), (FUNCPTR)mmapCancelDma, dmaHandle);
-                if (semTake(device->dmaComplete, 10*sysClkRateGet()) == ERROR)
+                if (semTake(device->dmaComplete, sysClkRateGet()) == ERROR)
                 {
-                    wdCancel(device->dmaWatchdog);
                     dmaRequestCancel(dmaHandle, TRUE);
                     errlogSevPrintf(errlogMajor,
                         "mmapWrite %s: DMA transfer timeout.\n",
                             device->name);
                     return ERROR;
                 }
-                wdCancel(device->dmaWatchdog);
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
                     /* try again with a slower DMA speed */
@@ -374,7 +368,7 @@ noDmaWrite:
 #endif /* HAVE_DMA */ 
     if (mmapDebug >= 1) printf ("mmapWrite %s: transfer from %p to %p, %d * %d bit\n",
         device->name, pdata, dst, nelem, dlen*8);
-    regDevCopy(dlen, nelem, pdata, dst, NULL, 0);
+    regDevCopy(dlen, nelem, pdata, dst, pmask, 0);
     SYNC
     return 0;
 }
@@ -409,6 +403,8 @@ void mmapInterrupt(void *arg)
 {
     regDevice *device = (regDevice *)arg;
     device->intrcount++;
+    if (mmapDebug >= 1) printf ("mmapInterrupt %s: count = %d, %s\n",
+        device->name, device->intrcount, device->intrhandler ? "calling handler" : "no handler installed");
     if (device->intrhandler)
     {
         if (device->intrhandler(device) != 0) return;
@@ -441,7 +437,7 @@ int mmapConfigure(
 
     if (name == NULL || size == 0)
     {
-        printf("usage: mmapConfigure(\"name\", baseaddress, size, addrspace)\n");
+        printf("usage: mmapConfigure(\"name\", baseaddress, size, addrspace, ivec, ilvl)\n");
         printf("maps register block to device \"name\"");
         printf("\"name\" must be a unique string on this IOC\n");
 #ifdef HAVE_MMAP
@@ -488,6 +484,15 @@ int mmapConfigure(
 #ifdef __vxworks
         if (sysBusToLocalAdrs(vmespace, (char*)baseaddress, &localbaseaddress) != OK)
 #else
+        if (!pdevLibVirtualOS)
+        {
+            errlogSevPrintf(errlogFatal,
+                "mmapConfigure %s: no VME support found on this machine\n",
+                name);
+            return -1;
+        }
+        /* simply make sure that devLibInit has been called */
+        devInterruptInUseVME(0);
         if ((*pdevLibVirtualOS->pDevMapAddr) (vmespace, 0, baseaddress, size, (volatile void **)(volatile char **)&localbaseaddress) != 0)
 #endif /*__vxworks*/
         {
@@ -499,81 +504,82 @@ int mmapConfigure(
         }
     }
 #endif /*HAVE_VME*/
-    if (vmespace == -1
+    if (vmespace == -1)
+    {
 #ifndef __vxworks
-        || strcmp(addrspace, "sim") == 0
+        if (strcmp(addrspace, "sim") == 0)
 #endif
-    )
-    {
-        /* Simulation runs on allocated memory */
-        localbaseaddress = calloc(1, size);
-        if (localbaseaddress == NULL)
         {
-            errlogSevPrintf(errlogFatal,
-                "mmapConfigure %s: out of memory allocating %d bytes of simulated address space\n",
-                name, size);
-            return errno;
-        }
-    }
-#ifdef HAVE_MMAP
-    else 
-    {
-        int fd;
-        int first = 1;
-        double sleep = 0.1;
-
-        do {
-            fd = open(addrspace, O_RDWR | O_SYNC);
-            if (fd >= 0)
+            /* Simulation runs on allocated memory */
+            localbaseaddress = calloc(1, size);
+            if (localbaseaddress == NULL)
             {
-                if (sleep > 0.1) epicsThreadSleep(1);
-                localbaseaddress = mmap(NULL, size,
-                    PROT_READ|PROT_WRITE, MAP_SHARED,
-                    fd, baseaddress);
-                close(fd);
+                errlogSevPrintf(errlogFatal,
+                    "mmapConfigure %s: out of memory allocating %d bytes of simulated address space\n",
+                    name, size);
+                return errno;
             }
-            else
-            {
-                flags |= READONLY_DEVICE;
-                fd = open(addrspace, O_RDONLY | O_SYNC);
+        }
+#ifdef HAVE_MMAP
+        else 
+        {
+            int fd;
+            int first = 1;
+            double sleep = 0.1;
+
+            do {
+                fd = open(addrspace, O_RDWR | O_SYNC);
                 if (fd >= 0)
                 {
                     if (sleep > 0.1) epicsThreadSleep(1);
                     localbaseaddress = mmap(NULL, size,
-                        PROT_READ, MAP_SHARED,
+                        PROT_READ|PROT_WRITE, MAP_SHARED,
                         fd, baseaddress);
                     close(fd);
                 }
-            }
-            if (fd < 0)
+                else
+                {
+                    flags |= READONLY_DEVICE;
+                    fd = open(addrspace, O_RDONLY | O_SYNC);
+                    if (fd >= 0)
+                    {
+                        if (sleep > 0.1) epicsThreadSleep(1);
+                        localbaseaddress = mmap(NULL, size,
+                            PROT_READ, MAP_SHARED,
+                            fd, baseaddress);
+                        close(fd);
+                    }
+                }
+                if (fd < 0)
+                {
+                    if (errno != ENOENT)
+                    {
+                        errlogSevPrintf(errlogFatal,
+                            "mmapConfigure %s: can't open %s: %s\n",
+                            name, addrspace, strerror(errno));
+                        return errno;
+                    }
+                    if (first)
+                    {
+                        first = 0;
+                        errlogSevPrintf(errlogInfo,
+                            "mmapConfigure %s: can't open %s: %s\nI will retry later...\n",
+                            name, addrspace, strerror(errno));
+                    }
+                    epicsThreadSleep(sleep);
+                    if (sleep < 10) sleep *= 1.1;
+                }
+            } while (fd < 0);
+            if (localbaseaddress == MAP_FAILED || localbaseaddress == NULL)
             {
-                if (errno != ENOENT)
-                {
-                    errlogSevPrintf(errlogFatal,
-                        "mmapConfigure %s: can't open %s: %s\n",
-                        name, addrspace, strerror(errno));
-                    return errno;
-                }
-                if (first)
-                {
-                    first = 0;
-                    errlogSevPrintf(errlogInfo,
-                        "mmapConfigure %s: can't open %s: %s\nI will retry later...\n",
-                        name, addrspace, strerror(errno));
-                }
-                epicsThreadSleep(sleep);
-                if (sleep < 10) sleep *= 1.1;
+                errlogSevPrintf(errlogFatal,
+                    "mmapConfigure %s: can't mmap %s: %s\n",
+                    name, addrspace, strerror(errno));
+                return errno;
             }
-        } while (fd < 0);
-        if (localbaseaddress == MAP_FAILED || localbaseaddress == NULL)
-        {
-            errlogSevPrintf(errlogFatal,
-                "mmapConfigure %s: can't mmap %s: %s\n",
-                name, addrspace, strerror(errno));
-            return errno;
         }
+#endif
     }
-#endif      
     device = (regDevice*)malloc(sizeof(regDevice));
     if (device == NULL)
     {
@@ -610,26 +616,10 @@ int mmapConfigure(
         }
     }
     device->dmaComplete = semBCreate(SEM_Q_FIFO, SEM_EMPTY);
-    device->dmaWatchdog = wdCreate();
 #endif /* HAVE_DMA */
 
     if (intrvector)
     {
-        if (vmespace <= 0)
-        {
-            errlogSevPrintf(errlogFatal,
-                "mmapConfigure %s: interrupts not supported on addrspace " ADDRSPACEFMT "\n",
-                name, addrspace);
-            return -1;
-        }
-        if (intrlevel < 1 || intrlevel > 7)
-        {
-            errlogSevPrintf(errlogFatal, 
-                "mmapConfigure %s: illegal interrupt level %d must be 1...7\n",
-                name, intrlevel);
-            return -1;
-        }
-#ifdef HAVE_VME
         if (devConnectInterrupt(intVME, intrvector, mmapInterrupt, device) != 0)
         {
             errlogSevPrintf(errlogFatal,
@@ -645,7 +635,6 @@ int mmapConfigure(
             return -1;
         }
         scanIoInit(&device->ioscanpvt);
-#endif /* HAVE_VME */
     }
     regDevRegisterDevice(name, &mmapSupport, device);
     return 0;
@@ -658,9 +647,9 @@ static const iocshArg mmapConfigureArg0 = { "name", iocshArgString };
 static const iocshArg mmapConfigureArg1 = { "baseaddress", iocshArgInt };
 static const iocshArg mmapConfigureArg2 = { "size", iocshArgInt };
 #ifdef __vxworks
-static const iocshArg mmapConfigureArg3 = { "addrspace (-1=simulation;16,24,32=VME,+100=block transfer)", iocshArgInt };
+static const iocshArg mmapConfigureArg3 = { "addrspace (-1=simulation; 16,24,32=VME,+100=block transfer)", iocshArgInt };
 #else
-static const iocshArg mmapConfigureArg3 = { "mapped device (sim=simulation, default:/dev/mem)", iocshArgString };
+static const iocshArg mmapConfigureArg3 = { "mapped device (sim=simulation; 16,24,32=VME; default:/dev/mem)", iocshArgString };
 #endif
 static const iocshArg mmapConfigureArg4 = { "intrvector (default:0)", iocshArgInt };
 static const iocshArg mmapConfigureArg5 = { "intrlevel (default:0)", iocshArgInt };
@@ -678,7 +667,7 @@ static const iocshArg * const mmapConfigureArgs[] = {
 };
 
 static const iocshFuncDef mmapConfigureDef =
-    { "mmapConfigure", 8, mmapConfigureArgs };
+    { "mmapConfigure", 6, mmapConfigureArgs };
     
 static void mmapConfigureFunc (const iocshArgBuf *args)
 {

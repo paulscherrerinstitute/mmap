@@ -48,7 +48,7 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.11 2013/09/12 14:54:07 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.12 2014/03/03 12:58:18 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -56,7 +56,6 @@ struct regDevice {
     volatile char* localbaseaddress;
     int vmespace;
     unsigned int baseaddress;
-    unsigned int size;
     unsigned int intrvector;
     unsigned int intrlevel;
     int (*intrhandler)(regDevice *device);
@@ -68,6 +67,7 @@ struct regDevice {
     int maxDmaSpeed;
     SEM_ID dmaComplete;
 #endif
+    char* addrspace;
 };
 
 int mmapDebug = 0;
@@ -84,12 +84,12 @@ void mmapReport(
 {
     if (device && device->magic == MAGIC)
     {
-        printf("mmap driver: %d bytes @ %p - %p\n",
-            device->size, device->localbaseaddress,
-            device->localbaseaddress+device->size-1);
-        if (level > 1)
+        printf("mmap %s:0x%x @%p\n",
+            device->addrspace, device->baseaddress, device->localbaseaddress);
+        if (level > 0)
         {
-            printf("  Interrupt count: %d\n", device->intrcount);
+            printf("        Interrupt level %d vector %d count: %d\n",
+                device->intrlevel, device->intrvector, device->intrcount);
         }
     }
 }
@@ -125,17 +125,18 @@ int mmapRead(
     unsigned int dlen,
     size_t nelem,
     void* pdata,
-    int prio)
+    int prio,
+    regDevTransferComplete callback,
+    char* user)
 {
     volatile char* src;
 
     if (!device || device->magic != MAGIC)
     {
         errlogSevPrintf(errlogMajor,
-            "mmapRead: illegal device handle\n");
+            "mmapRead %s: illegal device handle\n", user);
         return -1;
     }
-    regDevCheckOffset("mmapRead", device->name, offset, dlen, nelm, device->size);
     
     src = device->localbaseaddress+offset;
 #ifdef HAVE_DMA
@@ -181,8 +182,8 @@ int mmapRead(
             default:
                 goto noDmaRead;
         }
-        if (mmapDebug >= 1) printf ("mmapRead %s: block transfer from %p to %p, %d * %d bit\n",
-            device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
+        if (mmapDebug >= 1) printf ("mmapRead %s %s: block transfer from %p to %p, %d * %d bit\n",
+            user, device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
         while (1)
         {
             if ((dmaHandle = dmaTransferRequest(pdata, (unsigned char*) src, nelem*dlen,
@@ -193,8 +194,8 @@ int mmapRead(
                 {
                     dmaRequestCancel(dmaHandle, TRUE);
                     errlogSevPrintf(errlogMajor,
-                        "mmapRead %s: DMA transfer timeout.\n",
-                            device->name);
+                        "mmapRead %s %s: DMA transfer timeout.\n",
+                            user, device->name);
                     return ERROR;
                 }
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
@@ -208,8 +209,8 @@ int mmapRead(
                     return 0;
                 }
                 errlogSevPrintf(errlogMajor,
-                    "mmapRead %s: DMA %s error (0x%x). Using normal transfer.\n",
-                        device->name,
+                    "mmapRead %s %s: DMA %s error (0x%x). Using normal transfer.\n",
+                        user, device->name,
                         dmaStatus == DMA_PROERR ? "protocol" :
                         dmaStatus == DMA_BUSERR ? "vme" :
                         dmaStatus == DMA_CPUERR ? "pci" : 
@@ -224,16 +225,16 @@ int mmapRead(
                    * queue full
                    * unaligned access (already checked before)
                 */
-                if (mmapDebug >= 1) printf ("mmapRead %s: block transfer mode %x failed\n",
-                    device->name, dataWidth);
+                if (mmapDebug >= 1) printf ("mmapRead %s %s: block transfer mode %x failed\n",
+                    user, device->name, dataWidth);
                 break;
             }
         }
     }
 noDmaRead:    
 #endif /* HAVE_DMA */ 
-    if (mmapDebug >= 1) printf ("mmapRead %s: normal transfer from %p to %p, %d * %d bit\n",
-        device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
+    if (mmapDebug >= 1) printf ("mmapRead %s %s: normal transfer from %p to %p, %"Z"d * %d bit\n",
+        user, device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
     regDevCopy(dlen, nelem, src, pdata, NULL, 0);
     return 0;
 }
@@ -245,31 +246,25 @@ int mmapWrite(
     size_t nelem,
     void* pdata,
     void* pmask,
-    int prio)
+    int prio,
+    regDevTransferComplete callback,
+    char* user)
 {    
     volatile char* dst;
 
     if (!device || device->magic != MAGIC)
     {
         errlogSevPrintf(errlogMajor,
-            "mmapWrite: illegal device handle\n");
+            "mmapWrite %s: illegal device handle\n", user);
         return -1;
     }
     if (device->flags & READONLY_DEVICE)
     {
         errlogSevPrintf(errlogMajor,
-            "mmapWrite: device is read-only\n");
+            "mmapWrite %s %s: device is read-only\n", user, device->name);
         return -1;
     }
-    if (offset > device->size ||
-        offset+dlen*nelem > device->size)
-    {
-        errlogSevPrintf(errlogMajor,
-            "mmapWrite: address out of range\n");
-        return -1;
-    }
-    if (!device || device->magic != MAGIC
-        || offset+dlen*nelem > device->size) return -1;
+
     dst = device->localbaseaddress+offset;
 #ifdef HAVE_DMA
     /* Try block transfer for long arrays */
@@ -303,20 +298,20 @@ int mmapWrite(
         }
         switch (device->vmespace)
         {
-            case 16:
+            case atVMEA16:
                 addrMode = atVMEA16;
                 break;
-            case 24:
+            case atVMEA24:
                 addrMode = atVMEA24;
                 break;
-            case 32:
+            case atVMEA32:
                 addrMode = atVMEA32;
                 break;
             default:
                 goto noDmaWrite;
         }
-        if (mmapDebug >= 1) printf ("mmapWrite %s: block transfer from %p to %p, %d * %d bit\n",
-            device->name, pdata, device->localbaseaddress+offset, nelem, dlen*8);
+        if (mmapDebug >= 1) printf ("mmapWrite %s %s: block transfer from %p to %p, %d * %d bit\n",
+            user, device->name, pdata, device->localbaseaddress+offset, nelem, dlen*8);
         while (1)
         {
             if ((dmaHandle = dmaTransferRequest((unsigned char*) dst, pdata, nelem*dlen,
@@ -327,8 +322,8 @@ int mmapWrite(
                 {
                     dmaRequestCancel(dmaHandle, TRUE);
                     errlogSevPrintf(errlogMajor,
-                        "mmapWrite %s: DMA transfer timeout.\n",
-                            device->name);
+                        "mmapWrite %s %s: DMA transfer timeout.\n",
+                            user, device->name);
                     return ERROR;
                 }
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
@@ -342,8 +337,8 @@ int mmapWrite(
                     return 0;
                 }
                 errlogSevPrintf(errlogMajor,
-                    "mmapWrite %s: DMA %s error (0x%x). Using normal transfer.\n",
-                        device->name,
+                    "mmapWrite %s %s: DMA %s error (0x%x). Using normal transfer.\n",
+                        user, device->name,
                         dmaStatus == DMA_PROERR ? "protocol" :
                         dmaStatus == DMA_BUSERR ? "vme" :
                         dmaStatus == DMA_CPUERR ? "pci" : 
@@ -358,16 +353,16 @@ int mmapWrite(
                    * queue full
                    * unaligned access (already checked before)
                 */
-                if (mmapDebug >= 1) printf ("mmapWrite %s: block transfer mode %x failed\n",
-                    device->name, dataWidth);
+                if (mmapDebug >= 1) printf ("mmapWrite %s %s: block transfer mode %x failed\n",
+                    user, device->name, dataWidth);
                 break;
             }
         }
     }
 noDmaWrite:    
 #endif /* HAVE_DMA */ 
-    if (mmapDebug >= 1) printf ("mmapWrite %s: transfer from %p to %p, %d * %d bit\n",
-        device->name, pdata, dst, nelem, dlen*8);
+    if (mmapDebug >= 1) printf ("mmapWrite %s %s: transfer from %p to %p, %"Z"d * %d bit\n",
+        user, device->name, pdata, dst, nelem, dlen*8);
     regDevCopy(dlen, nelem, pdata, dst, pmask, 0);
     SYNC
     return 0;
@@ -589,8 +584,7 @@ int mmapConfigure(
         return errno;
     }
     device->magic = MAGIC;
-    device->name = name;
-    device->size = size;
+    device->name = strdup(name);
     device->vmespace = vmespace;
     device->baseaddress = baseaddress;
     device->localbaseaddress = localbaseaddress;
@@ -601,6 +595,22 @@ int mmapConfigure(
     device->ioscanpvt = NULL;
     device->intrcount = 0;
     device->flags = flags;
+    switch (vmespace)
+    {
+        case atVMEA16:
+            device->addrspace = "A16";
+            break;
+        case atVMEA24:
+            device->addrspace = "A24";
+            break;
+        case atVMEA32:
+            device->addrspace = "A32";
+            break;
+#ifndef __vxworks
+        default:
+            device->addrspace = strdup(addrspace);
+#endif
+    }
     
 #ifdef HAVE_DMA
     device->maxDmaSpeed=-1;
@@ -636,7 +646,7 @@ int mmapConfigure(
         }
         scanIoInit(&device->ioscanpvt);
     }
-    regDevRegisterDevice(name, &mmapSupport, device);
+    regDevRegisterDevice(name, &mmapSupport, device, size);
     return 0;
 }
 

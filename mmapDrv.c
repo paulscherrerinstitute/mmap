@@ -44,7 +44,7 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.13 2014/03/11 14:23:21 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.14 2014/03/11 14:34:23 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -450,8 +450,9 @@ int mmapConfigure(
     vmespace = addrspace;
 #else
     if (!addrspace || !addrspace[0]) { addrspace="/dev/mem"; }
-    if (strcmp(addrspace, "csr") == 0) { vmespace = 0xc; }
     sscanf (addrspace, "%i", &vmespace);
+    if (strcmp(addrspace, "csr") == 0) { vmespace = 0xc; }
+    if (strcmp(addrspace, "sim") == 0) { vmespace = -1; }
 #endif
     if (vmespace > 0)
     {
@@ -505,88 +506,82 @@ int mmapConfigure(
         }
     }
     else
+    if (vmespace < 0)
     {
-        if (vmespace < 0
-#ifndef __vxworks
-            || strcmp(addrspace, "sim") == 0
-#endif
-        )
+        /* Simulation runs on allocated memory */
+        localbaseaddress = calloc(1, size);
+        if (localbaseaddress == NULL)
         {
-            /* Simulation runs on allocated memory */
-            localbaseaddress = calloc(1, size);
-            if (localbaseaddress == NULL)
-            {
-                errlogSevPrintf(errlogFatal,
-                    "mmapConfigure %s: out of memory allocating %d bytes of simulated address space\n",
-                    name, size);
-                return errno;
-            }
-            if (mmapDebug) printf ("mmapConfigure %s: simulation @%p\n",
-                name, localbaseaddress);
+            errlogSevPrintf(errlogFatal,
+                "mmapConfigure %s: out of memory allocating %d bytes of simulated address space\n",
+                name, size);
+            return errno;
         }
+        if (mmapDebug) printf ("mmapConfigure %s: simulation @%p\n",
+            name, localbaseaddress);
+    }
 #ifdef HAVE_MMAP
-        else 
-        {
-            int fd;
-            int first = 1;
-            double sleep = 0.1;
+    else 
+    {
+        int fd;
+        int first = 1;
+        double sleep = 0.1;
 
-            if (mmapDebug) printf ("mmapConfigure %s: mmap to %s\n",
-                name, addrspace);
+        if (mmapDebug) printf ("mmapConfigure %s: mmap to %s\n",
+            name, addrspace);
 
-            do {
-                fd = open(addrspace, O_RDWR | O_SYNC);
+        do {
+            fd = open(addrspace, O_RDWR | O_SYNC);
+            if (fd >= 0)
+            {
+                if (sleep > 0.1) epicsThreadSleep(1);
+                localbaseaddress = mmap(NULL, size,
+                    PROT_READ|PROT_WRITE, MAP_SHARED,
+                    fd, baseaddress);
+                close(fd);
+            }
+            else
+            {
+                flags |= READONLY_DEVICE;
+                fd = open(addrspace, O_RDONLY | O_SYNC);
                 if (fd >= 0)
                 {
                     if (sleep > 0.1) epicsThreadSleep(1);
                     localbaseaddress = mmap(NULL, size,
-                        PROT_READ|PROT_WRITE, MAP_SHARED,
+                        PROT_READ, MAP_SHARED,
                         fd, baseaddress);
                     close(fd);
                 }
-                else
-                {
-                    flags |= READONLY_DEVICE;
-                    fd = open(addrspace, O_RDONLY | O_SYNC);
-                    if (fd >= 0)
-                    {
-                        if (sleep > 0.1) epicsThreadSleep(1);
-                        localbaseaddress = mmap(NULL, size,
-                            PROT_READ, MAP_SHARED,
-                            fd, baseaddress);
-                        close(fd);
-                    }
-                }
-                if (fd < 0)
-                {
-                    if (errno != ENOENT)
-                    {
-                        errlogSevPrintf(errlogFatal,
-                            "mmapConfigure %s: can't open %s: %s\n",
-                            name, addrspace, strerror(errno));
-                        return errno;
-                    }
-                    if (first)
-                    {
-                        first = 0;
-                        errlogSevPrintf(errlogInfo,
-                            "mmapConfigure %s: can't open %s: %s\nI will retry later...\n",
-                            name, addrspace, strerror(errno));
-                    }
-                    epicsThreadSleep(sleep);
-                    if (sleep < 10) sleep *= 1.1;
-                }
-            } while (fd < 0);
-            if (localbaseaddress == MAP_FAILED || localbaseaddress == NULL)
-            {
-                errlogSevPrintf(errlogFatal,
-                    "mmapConfigure %s: can't mmap %s: %s\n",
-                    name, addrspace, strerror(errno));
-                return errno;
             }
+            if (fd < 0)
+            {
+                if (errno != ENOENT)
+                {
+                    errlogSevPrintf(errlogFatal,
+                        "mmapConfigure %s: can't open %s: %s\n",
+                        name, addrspace, strerror(errno));
+                    return errno;
+                }
+                if (first)
+                {
+                    first = 0;
+                    errlogSevPrintf(errlogInfo,
+                        "mmapConfigure %s: can't open %s: %s\nI will retry later...\n",
+                        name, addrspace, strerror(errno));
+                }
+                epicsThreadSleep(sleep);
+                if (sleep < 10) sleep *= 1.1;
+            }
+        } while (fd < 0);
+        if (localbaseaddress == MAP_FAILED || localbaseaddress == NULL)
+        {
+            errlogSevPrintf(errlogFatal,
+                "mmapConfigure %s: can't mmap %s: %s\n",
+                name, addrspace, strerror(errno));
+            return errno;
         }
-#endif
     }
+#endif
     device = (regDevice*)malloc(sizeof(regDevice));
     if (device == NULL)
     {
@@ -609,6 +604,12 @@ int mmapConfigure(
     device->flags = flags;
     switch (vmespace)
     {
+        case -1:
+            device->addrspace = "sim";
+            break;
+        case atVMECSR:
+            device->addrspace = "CR/CSR";
+            break;
         case atVMEA16:
             device->addrspace = "A16";
             break;
@@ -623,6 +624,8 @@ int mmapConfigure(
             device->addrspace = strdup(addrspace);
 #endif
     }
+    if (mmapDebug) printf ("mmapConfigure %s: vmespace = %d addrspace = %s\n",
+        name, vmespace, device->addrspace);
     
 #ifdef HAVE_DMA
     device->maxDmaSpeed=-1;

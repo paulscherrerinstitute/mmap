@@ -9,46 +9,42 @@
 #include <regDev.h>
 
 #ifdef __unix
-#include <sys/mman.h>
-#define HAVE_MMAP
+ #include <sys/mman.h>
+ #define HAVE_MMAP
 #endif /*__unix */
 
-#ifdef __vxworks
-#include <sysLib.h>
-#include <intLib.h>
-#include <wdLib.h>
-#include <semLib.h>
-#define HAVE_VME
-#include <vme.h>
-#include <iv.h>
-#define atVMEA16 VME_AM_USR_SHORT_IO
-#define atVMEA24 VME_AM_STD_SUP_DATA
-#define atVMEA32 VME_AM_EXT_SUP_DATA
-#include <version.h>
-#ifdef RUNTIME_VERSION /* VxWorks 5.5+ */
-#define HAVE_DMA
-#include <dmaLib.h>
-#endif /* VxWorks 5.5+ */
-#else /*__vxworks */
-#include <devLib.h>
-#endif /* __vxworks */
-
 #ifdef EPICS_3_14
-#define HAVE_VME
-#include <epicsTypes.h>
-#include <epicsThread.h>
-#endif
+ #include <devLibVME.h>
+ #include <epicsTypes.h>
+ #include <epicsThread.h>
+#else /* 3.13 is vxWorks only */
+ #include <sysLib.h>
+ #include <intLib.h>
+ #include <wdLib.h>
+ #include <semLib.h>
+ #include <vme.h>
+ #include <iv.h>
+ #define atVMEA16 VME_AM_USR_SHORT_IO
+ #define atVMEA24 VME_AM_STD_SUP_DATA
+ #define atVMEA32 VME_AM_EXT_SUP_DATA
+ #define atVMECSR VME_AM_CSR
+ #include <version.h>
+ #ifdef RUNTIME_VERSION /* VxWorks 5.5+ */
+  #define HAVE_DMA
+  #include <dmaLib.h>
+ #endif /* VxWorks 5.5+ */
+#endif /* else EPICS_3_14 */
 
 #if defined (__GNUC__) && defined (_ARCH_PPC)
-#define SYNC __asm__("eieio;sync");
+ #define SYNC __asm__("eieio;sync");
 #else
-#define SYNC
+ #define SYNC
 #endif
 
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.12 2014/03/03 12:58:18 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.13 2014/03/11 14:23:21 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -433,33 +429,41 @@ int mmapConfigure(
     if (name == NULL || size == 0)
     {
         printf("usage: mmapConfigure(\"name\", baseaddress, size, addrspace, ivec, ilvl)\n");
-        printf("maps register block to device \"name\"");
+        printf("maps register block to device \"name\"\n");
         printf("\"name\" must be a unique string on this IOC\n");
 #ifdef HAVE_MMAP
         printf("addrspace: device used for mapping (default: /dev/mem)\n");
 #endif
-#ifdef HAVE_VME
-        printf("addrspace = 16, 24 or 32: VME address space"
+#ifdef __vxworks
+        printf("addrspace = 0xc, 16, 24 or 32: VME address space (0xc means CSR)"
+#else
+        printf("addrspace = csr, 16, 24 or 32: VME address space"
+#endif
 #ifdef HAVE_DMA
                 " (+100: allow block transfer)"
 #endif
                 "\n");
-#endif
         printf("addrspace = sim: simulation on allocated memory\n");
         return 0;
     }
-#ifdef HAVE_VME        
 #ifdef __vxworks
     vmespace = addrspace;
 #else
     if (!addrspace || !addrspace[0]) { addrspace="/dev/mem"; }
-    if (sscanf (addrspace, "%d", &vmespace) == 1)
+    if (strcmp(addrspace, "csr") == 0) { vmespace = 0xc; }
+    sscanf (addrspace, "%i", &vmespace);
 #endif
+    if (vmespace > 0)
     {
         flags=vmespace/100;
         vmespace%=100;
+        if (mmapDebug) printf ("mmapConfigure %s: vmespace = %d\n",
+            name, vmespace);
         switch (vmespace)
         {
+            case 0xc:
+                vmespace = atVMECSR;
+                break;
             case 16:
                 vmespace = atVMEA16;
                 break;
@@ -469,16 +473,16 @@ int mmapConfigure(
             case 32:
                 vmespace = atVMEA32;
                 break;
+            case -1:
+                break;
             default:
                 errlogSevPrintf(errlogFatal,
                     "mmapConfigure %s: illegal VME address space "
-                    ADDRSPACEFMT " must be 16, 24 or 32\n",
+                    ADDRSPACEFMT " must be 0xc, 16, 24 or 32\n",
                     name, addrspace);
                 return -1;
         }
-#ifdef __vxworks
-        if (sysBusToLocalAdrs(vmespace, (char*)baseaddress, &localbaseaddress) != OK)
-#else
+#ifdef EPICS_3_14
         if (!pdevLibVirtualOS)
         {
             errlogSevPrintf(errlogFatal,
@@ -489,7 +493,9 @@ int mmapConfigure(
         /* simply make sure that devLibInit has been called */
         devInterruptInUseVME(0);
         if ((*pdevLibVirtualOS->pDevMapAddr) (vmespace, 0, baseaddress, size, (volatile void **)(volatile char **)&localbaseaddress) != 0)
-#endif /*__vxworks*/
+#else
+        if (sysBusToLocalAdrs(vmespace, (char*)baseaddress, &localbaseaddress) != OK)
+#endif
         {
             errlogSevPrintf(errlogFatal,
                 "mmapConfigure %s: can't map address 0x%08x on "
@@ -498,12 +504,13 @@ int mmapConfigure(
             return -1;
         }
     }
-#endif /*HAVE_VME*/
-    if (vmespace == -1)
+    else
     {
+        if (vmespace < 0
 #ifndef __vxworks
-        if (strcmp(addrspace, "sim") == 0)
+            || strcmp(addrspace, "sim") == 0
 #endif
+        )
         {
             /* Simulation runs on allocated memory */
             localbaseaddress = calloc(1, size);
@@ -514,6 +521,8 @@ int mmapConfigure(
                     name, size);
                 return errno;
             }
+            if (mmapDebug) printf ("mmapConfigure %s: simulation @%p\n",
+                name, localbaseaddress);
         }
 #ifdef HAVE_MMAP
         else 
@@ -521,6 +530,9 @@ int mmapConfigure(
             int fd;
             int first = 1;
             double sleep = 0.1;
+
+            if (mmapDebug) printf ("mmapConfigure %s: mmap to %s\n",
+                name, addrspace);
 
             do {
                 fd = open(addrspace, O_RDWR | O_SYNC);
@@ -657,9 +669,9 @@ static const iocshArg mmapConfigureArg0 = { "name", iocshArgString };
 static const iocshArg mmapConfigureArg1 = { "baseaddress", iocshArgInt };
 static const iocshArg mmapConfigureArg2 = { "size", iocshArgInt };
 #ifdef __vxworks
-static const iocshArg mmapConfigureArg3 = { "addrspace (-1=simulation; 16,24,32=VME,+100=block transfer)", iocshArgInt };
+static const iocshArg mmapConfigureArg3 = { "addrspace (-1=simulation; 0xc=CSR; 16,24,32=VME,+100=block transfer)", iocshArgInt };
 #else
-static const iocshArg mmapConfigureArg3 = { "mapped device (sim=simulation; 16,24,32=VME; default:/dev/mem)", iocshArgString };
+static const iocshArg mmapConfigureArg3 = { "mapped device (sim=simulation; csr,16,24,32=VME; default:/dev/mem)", iocshArgString };
 #endif
 static const iocshArg mmapConfigureArg4 = { "intrvector (default:0)", iocshArgInt };
 static const iocshArg mmapConfigureArg5 = { "intrlevel (default:0)", iocshArgInt };

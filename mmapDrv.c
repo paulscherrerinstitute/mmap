@@ -44,7 +44,7 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.14 2014/03/11 14:34:23 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.15 2014/03/24 13:32:10 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -491,9 +491,11 @@ int mmapConfigure(
                 name);
             return -1;
         }
-        /* simply make sure that devLibInit has been called */
-        devInterruptInUseVME(0);
-        if ((*pdevLibVirtualOS->pDevMapAddr) (vmespace, 0, baseaddress, size, (volatile void **)(volatile char **)&localbaseaddress) != 0)
+
+        /* just make sure that devLibInit has been called (call will fail) */
+        devRegisterAddress(NULL, 0, 0, 0, NULL);
+        
+        if (pdevLibVirtualOS->pDevMapAddr(vmespace, 0, baseaddress, size, (volatile void **)(volatile char **)&localbaseaddress) != 0)
 #else
         if (sysBusToLocalAdrs(vmespace, (char*)baseaddress, &localbaseaddress) != OK)
 #endif

@@ -28,12 +28,17 @@
  #define atVMEA24 VME_AM_STD_SUP_DATA
  #define atVMEA32 VME_AM_EXT_SUP_DATA
  #define atVMECSR VME_AM_CSR
- #include <version.h>
- #ifdef RUNTIME_VERSION /* VxWorks 5.5+ */
-  #define HAVE_DMA
-  #include <dmaLib.h>
- #endif /* VxWorks 5.5+ */
 #endif /* else EPICS_3_14 */
+
+/* Try to find dma support */
+#define HAVE_DMA
+#include <dmaLib.h>
+#ifdef HAVE_DMA
+ #ifdef vxWorks
+  #include <semLib.h>
+  #include <sysLib.h>
+ #endif /* vxWorks */
+#endif /* HAVE_DMA */
 
 #if defined (__GNUC__) && defined (_ARCH_PPC)
  #define SYNC __asm__("eieio;sync");
@@ -44,7 +49,7 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.15 2014/03/24 13:32:10 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.16 2014/04/02 15:31:40 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -107,6 +112,7 @@ IOSCANPVT mmapGetInScanPvt(
 
 #ifdef HAVE_DMA
 static const int dmaModes [] = {DT64, DT2eVME, DT2eSST160, DT2eSST267, DT2eSST320};
+static const char* dmaModeStr [] = {"DT64", "DT2eVME", "DT2eSST160", "DT2eSST267", "DT2eSST320"};
 
 void mmapCancelDma(int handle)
 {
@@ -190,13 +196,16 @@ int mmapRead(
                 {
                     dmaRequestCancel(dmaHandle, TRUE);
                     errlogSevPrintf(errlogMajor,
-                        "mmapRead %s %s: DMA transfer timeout.\n",
+                        "mmapRead %s %s: block transfer timeout.\n",
                             user, device->name);
                     return ERROR;
                 }
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
-                    /* try again with a slower DMA speed */
+                    /* try again with a slower block transfer speed */
+                    if (mmapDebug >= 1)
+                        printf ("mmapRead %s %s: block transfer mode %s failed. trying slower speed\n",
+                            user, device->name, dmaModeStr[device->maxDmaSpeed]);
                     dataWidth = dmaModes[--device->maxDmaSpeed];
                     continue;
                 }
@@ -318,13 +327,16 @@ int mmapWrite(
                 {
                     dmaRequestCancel(dmaHandle, TRUE);
                     errlogSevPrintf(errlogMajor,
-                        "mmapWrite %s %s: DMA transfer timeout.\n",
+                        "mmapWrite %s %s: block transfer transfer timeout.\n",
                             user, device->name);
                     return ERROR;
                 }
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
-                    /* try again with a slower DMA speed */
+                    /* try again with a slower block transfer speed */
+                    if (mmapDebug >= 1)
+                        printf ("mmapWrite %s %s: block transfer mode %s failed. trying slower speed\n",
+                            user, device->name, dmaModeStr[device->maxDmaSpeed]);
                     dataWidth = dmaModes[--device->maxDmaSpeed];
                     continue;
                 }
@@ -638,6 +650,8 @@ int mmapConfigure(
             if (dmaProtocolSupport(dmaModes[i]) == OK)
             {
                 device->maxDmaSpeed = i;
+                if (mmapDebug) printf ("mmapConfigure %s: maxDmaSpeed=%s\n",
+                    name, dmaModeStr[device->maxDmaSpeed]);
                 break;
             }
         }

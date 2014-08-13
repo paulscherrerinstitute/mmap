@@ -49,7 +49,7 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.16 2014/04/02 15:31:40 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.17 2014/08/13 12:18:55 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;
@@ -556,7 +556,6 @@ int mmapConfigure(
             }
             else
             {
-                flags |= READONLY_DEVICE;
                 fd = open(addrspace, O_RDONLY | O_SYNC);
                 if (fd >= 0)
                 {
@@ -565,6 +564,7 @@ int mmapConfigure(
                         PROT_READ, MAP_SHARED,
                         fd, baseaddress);
                     close(fd);
+                    flags |= READONLY_DEVICE;
                 }
             }
             if (fd < 0)

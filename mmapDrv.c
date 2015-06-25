@@ -14,9 +14,11 @@
 #endif /*__unix */
 
 #ifdef EPICS_3_14
+ #include <errlog.h>
  #include <devLibVME.h>
  #include <epicsTypes.h>
  #include <epicsThread.h>
+ #include <epicsExport.h>
 #else /* 3.13 is vxWorks only */
  #include <sysLib.h>
  #include <intLib.h>
@@ -49,7 +51,7 @@
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.17 2014/08/13 12:18:55 zimoch Exp $";
+    "$Id: mmapDrv.c,v 1.18 2015/06/25 14:57:42 zimoch Exp $";
 
 struct regDevice {
     unsigned long magic;

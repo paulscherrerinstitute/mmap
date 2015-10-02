@@ -568,10 +568,10 @@ int mmapConfigure(
                 name, addrspace);
         }
         
-        /* check size (if we cannot let's just hope for the best) and grow if necessary */
-        if (fstat(fd, &sb) != -1) 
+        /* check (regular) file size (if we cannot let's just hope for the best) and grow if necessary */
+        if (fstat(fd, &sb) != -1)
         {
-            if (mapsize + mapstart > sb.st_size)
+            if ((sb.st_mode & S_IFREG) && mapsize + mapstart > sb.st_size)
             {
                 if (mmapDebug) printf ("mmapConfigure %s: growing %s from %ld to %ld bytes\n",
                     name, addrspace, sb.st_size, mapsize + mapstart);

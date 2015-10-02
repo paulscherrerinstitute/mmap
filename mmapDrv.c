@@ -10,6 +10,7 @@
 
 #ifdef __unix
  #include <sys/mman.h>
+ #include <sys/stat.h>
  #define HAVE_MMAP
 #endif /*__unix */
 
@@ -424,7 +425,7 @@ int mmapConfigure(
     unsigned int baseaddress,
     unsigned int size,
 #ifdef __vxworks
-    int addrspace,
+    int addrspace,   /* int for compatibility with earliner versions */
 #define ADDRSPACEFMT "%d"
 #else
     char* addrspace,
@@ -437,7 +438,7 @@ int mmapConfigure(
 {
     regDevice* device;
     char* localbaseaddress;
-    int vmespace=0;
+    int vmespace=-2;
     int flags=0;
 
     if (name == NULL || size == 0)
@@ -488,8 +489,6 @@ int mmapConfigure(
             case 32:
                 vmespace = atVMEA32;
                 break;
-            case -1:
-                break;
             default:
                 errlogSevPrintf(errlogFatal,
                     "mmapConfigure %s: illegal VME address space "
@@ -522,7 +521,7 @@ int mmapConfigure(
         }
     }
     else
-    if (vmespace < 0)
+    if (vmespace == -1)
     {
         /* Simulation runs on allocated memory */
         localbaseaddress = calloc(1, size);
@@ -539,56 +538,69 @@ int mmapConfigure(
 #ifdef HAVE_MMAP
     else 
     {
+        struct stat sb;
         int fd;
-        int first = 1;
-        double sleep = 0.1;
-
+        off_t mapstart;
+        size_t mapsize;
+        
         if (mmapDebug) printf ("mmapConfigure %s: mmap to %s\n",
             name, addrspace);
+            
+        /* round down start address to page size fo mmap() */
+        mapstart = baseaddress & ~((off_t)(sysconf(_SC_PAGE_SIZE)-1));
+        mapsize = size + (baseaddress - mapstart);
 
-        do {
-            fd = open(addrspace, O_RDWR | O_SYNC);
-            if (fd >= 0)
-            {
-                if (sleep > 0.1) epicsThreadSleep(1);
-                localbaseaddress = mmap(NULL, size,
-                    PROT_READ|PROT_WRITE, MAP_SHARED,
-                    fd, baseaddress);
-                close(fd);
-            }
-            else
-            {
-                fd = open(addrspace, O_RDONLY | O_SYNC);
-                if (fd >= 0)
-                {
-                    if (sleep > 0.1) epicsThreadSleep(1);
-                    localbaseaddress = mmap(NULL, size,
-                        PROT_READ, MAP_SHARED,
-                        fd, baseaddress);
-                    close(fd);
-                    flags |= READONLY_DEVICE;
-                }
-            }
+        /* first try to open read/write, create if necessary (and possible) */
+        fd = open(addrspace, O_RDWR | O_CREAT, 0777);
+        if (fd < 0)
+        {
+            /* cannot open R/W or cannot create: try to open readonly */
+            fd = open(addrspace, O_RDONLY);
             if (fd < 0)
             {
-                if (errno != ENOENT)
+                errlogSevPrintf(errlogFatal,
+                    "mmapConfigure %s: %s: %s\n",
+                    name, addrspace, strerror(errno));
+                return errno;
+            }
+            flags |= READONLY_DEVICE;
+            if (mmapDebug) printf ("mmapConfigure %s: %s is readonly\n",
+                name, addrspace);
+        }
+        
+        /* check size (if we cannot let's just hope for the best) and grow if necessary */
+        if (fstat(fd, &sb) != -1) 
+        {
+            if (mapsize + mapstart > sb.st_size)
+            {
+                if (mmapDebug) printf ("mmapConfigure %s: growing %s from %ld to %ld bytes\n",
+                    name, addrspace, sb.st_size, mapsize + mapstart);
+                if (ftruncate(fd, mapsize + mapstart) == -1)
                 {
                     errlogSevPrintf(errlogFatal,
-                        "mmapConfigure %s: can't open %s: %s\n",
+                        "mmapConfigure %s: %s too small and cannot grow: %s\n",
                         name, addrspace, strerror(errno));
+                    close(fd);
                     return errno;
                 }
-                if (first)
-                {
-                    first = 0;
-                    errlogSevPrintf(errlogInfo,
-                        "mmapConfigure %s: can't open %s: %s\nI will retry later...\n",
-                        name, addrspace, strerror(errno));
-                }
-                epicsThreadSleep(sleep);
-                if (sleep < 10) sleep *= 1.1;
             }
-        } while (fd < 0);
+        }
+        else
+            if (mmapDebug) printf ("mmapConfigure %s: cannot stat %s: %s\n",
+                name, addrspace, strerror(errno));
+
+        /* map shared with other processes read/write or readonly */
+        if (mmapDebug) printf ("mmapConfigure %s: mmap(NULL, %"Z"u, %s, MAP_SHARED, %d (%s), %ld)\n",
+            name, mapsize, (flags &= READONLY_DEVICE) ? "PROT_READ" : "PROT_READ|PROT_WRITE",
+            fd, addrspace, mapstart);
+            
+        localbaseaddress = mmap(NULL, mapsize,
+            (flags &= READONLY_DEVICE) ? PROT_READ : PROT_READ|PROT_WRITE,
+            MAP_SHARED, fd, mapstart);
+
+        /* we don't need the file descriptor any more */
+        close(fd);
+        
         if (localbaseaddress == MAP_FAILED || localbaseaddress == NULL)
         {
             errlogSevPrintf(errlogFatal,
@@ -596,8 +608,14 @@ int mmapConfigure(
                 name, addrspace, strerror(errno));
             return errno;
         }
+        
+        /* adjust localbaseaddress by the offset within the page */
+        if (mmapDebug) printf ("mmapConfigure %s: mmap returned %p, adjusting by %ld bytes\n",
+            name, localbaseaddress, baseaddress - mapstart);
+        localbaseaddress += (baseaddress - mapstart);
     }
 #endif
+
     device = (regDevice*)malloc(sizeof(regDevice));
     if (device == NULL)
     {

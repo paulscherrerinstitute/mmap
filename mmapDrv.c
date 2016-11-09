@@ -20,6 +20,7 @@
  #include <epicsTypes.h>
  #include <epicsThread.h>
  #include <epicsExport.h>
+ #include <epicsEvent.h>
 #else /* 3.13 is vxWorks only */
  #include <sysLib.h>
  #include <intLib.h>
@@ -31,6 +32,11 @@
  #define atVMEA24 VME_AM_STD_SUP_DATA
  #define atVMEA32 VME_AM_EXT_SUP_DATA
  #define atVMECSR VME_AM_CSR
+ #define epicsEventId SEM_ID
+ #define epicsEventWaitWithTimeout(s,t) semTake(s, t*sysClkRateGet())
+ #define epicsEventWaitOK OK
+ #define epicsEventMustCreate(i) semBCreate(SEM_Q_FIFO, i)
+ #define epicsEventEmpty SEM_EMPTY
 #endif /* else EPICS_3_14 */
 
 /* Try to find dma support */
@@ -69,7 +75,7 @@ struct regDevice {
     int flags;
 #ifdef HAVE_DMA
     int maxDmaSpeed;
-    SEM_ID dmaComplete;
+    epicsEventId dmaComplete;
 #endif
     char* addrspace;
 };
@@ -100,7 +106,11 @@ void mmapReport(
 
 IOSCANPVT mmapGetInScanPvt(
     regDevice *device,
-    size_t offset)
+    size_t offset,
+    unsigned int dlen,
+    size_t nelem,
+    int intvec,
+    const char* user)
 {
     if (!device || device->magic != MAGIC)
     { 
@@ -114,8 +124,8 @@ IOSCANPVT mmapGetInScanPvt(
 #define mmapGetOutScanPvt mmapGetInScanPvt
 
 #ifdef HAVE_DMA
-static const int dmaModes [] = {DT64, DT2eVME, DT2eSST160, DT2eSST267, DT2eSST320};
-static const char* dmaModeStr [] = {"DT64", "DT2eVME", "DT2eSST160", "DT2eSST267", "DT2eSST320"};
+static const int dmaModes [] = {DT32, DT64, DT2eVME, DT2eSST160, DT2eSST267, DT2eSST320};
+static const char* dmaModeStr [] = {"BLT", "MBLT", "2eVME", "2eSST160", "2eSST267", "2eSST320"};
 
 void mmapCancelDma(int handle)
 {
@@ -132,7 +142,7 @@ int mmapRead(
     void* pdata,
     int prio,
     regDevTransferComplete callback,
-    char* user)
+    const char* user)
 {
     volatile char* src;
 
@@ -150,29 +160,10 @@ int mmapRead(
         (device->flags & ALLOW_BLOCK_TRANSFER) && /* card must be able to do block transfer */
         (((long)pdata|(long)src) & 0x7) == 0)     /* src and dst address must be multiple of 8 */
     {
-        UINT32 addrMode;
-        UINT32 dataWidth;
-        int dmaHandle;
+        unsigned int addrMode;
         unsigned int dmaStatus;
         
-        switch (dlen)
-        {
-            case 1:
-                dataWidth = DT8;
-                break;
-            case 2:
-                dataWidth = DT16;
-                break;
-            case 4:
-                dataWidth = DT32;
-                break;
-            case 8:
-                if (device->maxDmaSpeed == -1) goto noDmaRead;
-                dataWidth = dmaModes[device->maxDmaSpeed];
-                break;
-            default:
-                goto noDmaRead;
-        }
+        if (device->maxDmaSpeed == -1) goto noDmaRead;
         switch (device->vmespace)
         {
             case atVMEA16:
@@ -187,29 +178,36 @@ int mmapRead(
             default:
                 goto noDmaRead;
         }
-        if (mmapDebug >= 1) printf ("mmapRead %s %s: block transfer from %p to %p, %d * %d bit\n",
+        if (mmapDebug >= 1) printf ("mmapRead %s %s: block transfer from %p to %p, 0x%"Z"x * %d bit\n",
             user, device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
         while (1)
         {
+#ifdef dmaTransferRequest_can_wait
+            if (dmaTransferRequest(pdata, (unsigned char*) src, nelem*dlen,
+                    addrMode, dmaModes[device->maxDmaSpeed], V2C, 100, NULL, NULL, &dmaStatus) != -1)
+            {           
+#else
+            int dmaHandle;
             if ((dmaHandle = dmaTransferRequest(pdata, (unsigned char*) src, nelem*dlen,
-                    addrMode, dataWidth, V2C, 100,
-                    (VOIDFUNCPTR)semGive, device->dmaComplete, &dmaStatus)) != ERROR)
+                    addrMode, dmaModes[device->maxDmaSpeed], V2C, 100,
+                    (VOIDFUNCPTR)semGive, device->dmaComplete, &dmaStatus)) != -1)
             {
-                if (semTake(device->dmaComplete, sysClkRateGet()) == ERROR)
+                if (epicsEventWaitWithTimeout(device->dmaComplete, 1.0) != epicsEventWaitOK)
                 {
                     dmaRequestCancel(dmaHandle, TRUE);
                     errlogSevPrintf(errlogMajor,
                         "mmapRead %s %s: block transfer timeout.\n",
                             user, device->name);
-                    return ERROR;
+                    return -1;
                 }
+#endif
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
                     /* try again with a slower block transfer speed */
                     if (mmapDebug >= 1)
                         printf ("mmapRead %s %s: block transfer mode %s failed. trying slower speed\n",
                             user, device->name, dmaModeStr[device->maxDmaSpeed]);
-                    dataWidth = dmaModes[--device->maxDmaSpeed];
+                    device->maxDmaSpeed--;
                     continue;
                 }
                 if (dmaStatus == DMA_DONE)
@@ -233,15 +231,15 @@ int mmapRead(
                    * queue full
                    * unaligned access (already checked before)
                 */
-                if (mmapDebug >= 1) printf ("mmapRead %s %s: block transfer mode %x failed\n",
-                    user, device->name, dataWidth);
+                if (mmapDebug >= 1) printf ("mmapRead %s %s: block transfer mode %s failed\n",
+                    user, device->name, dmaModeStr[device->maxDmaSpeed]);
                 break;
             }
         }
     }
 noDmaRead:    
 #endif /* HAVE_DMA */ 
-    if (mmapDebug >= 1) printf ("mmapRead %s %s: normal transfer from %p to %p, %"Z"d * %d bit\n",
+    if (mmapDebug >= 1) printf ("mmapRead %s %s: normal transfer from %p to %p, 0x%"Z"x * %d bit\n",
         user, device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
     regDevCopy(dlen, nelem, src, pdata, NULL, 0);
     return 0;
@@ -256,7 +254,7 @@ int mmapWrite(
     void* pmask,
     int prio,
     regDevTransferComplete callback,
-    char* user)
+    const char* user)
 {    
     volatile char* dst;
 
@@ -281,29 +279,10 @@ int mmapWrite(
         (device->flags & ALLOW_BLOCK_TRANSFER) && /* card must be able to do block transfer */
         (((long)pdata|(long)dst) & 0x7) == 0)     /* src and dst address must be multiple of 8 */
     {
-        UINT32 addrMode;
-        UINT32 dataWidth;
-        int dmaHandle;
+        unsigned int addrMode;
         unsigned int dmaStatus;
         
-        switch (dlen)
-        {
-            case 1:
-                dataWidth = DT8;
-                break;
-            case 2:
-                dataWidth = DT16;
-                break;
-            case 4:
-                dataWidth = DT32;
-                break;
-            case 8:
-                if (device->maxDmaSpeed == -1) goto noDmaWrite;
-                dataWidth = dmaModes[device->maxDmaSpeed];
-                break;
-            default:
-                goto noDmaWrite;
-        }
+        if (device->maxDmaSpeed == -1) goto noDmaWrite;
         switch (device->vmespace)
         {
             case atVMEA16:
@@ -318,29 +297,36 @@ int mmapWrite(
             default:
                 goto noDmaWrite;
         }
-        if (mmapDebug >= 1) printf ("mmapWrite %s %s: block transfer from %p to %p, %d * %d bit\n",
+        if (mmapDebug >= 1) printf ("mmapWrite %s %s: block transfer from %p to %p, 0x%"Z"x * %d bit\n",
             user, device->name, pdata, device->localbaseaddress+offset, nelem, dlen*8);
         while (1)
         {
+#ifdef dmaTransferRequest_can_wait
+            if ((dmaStatus = dmaTransferRequest((unsigned char*) dst, pdata, nelem*dlen,
+                    addrMode, dmaModes[device->maxDmaSpeed], C2V, 100, NULL, NULL, &dmaStatus)) != -1)
+            {           
+#else
+            int dmaHandle;
             if ((dmaHandle = dmaTransferRequest((unsigned char*) dst, pdata, nelem*dlen,
-                    addrMode, dataWidth, C2V, 100,
-                    (VOIDFUNCPTR)semGive, device->dmaComplete, &dmaStatus)) != ERROR)
+                    addrMode, dmaModes[device->maxDmaSpeed], C2V, 100,
+                    (VOIDFUNCPTR)semGive, device->dmaComplete, &dmaStatus)) != -1)
             {
-                if (semTake(device->dmaComplete, sysClkRateGet()) == ERROR)
+                if (epicsEventWaitWithTimeout(device->dmaComplete, 1.0) != epicsEventWaitOK)
                 {
                     dmaRequestCancel(dmaHandle, TRUE);
                     errlogSevPrintf(errlogMajor,
                         "mmapWrite %s %s: block transfer transfer timeout.\n",
                             user, device->name);
-                    return ERROR;
+                    return -1;
                 }
+#endif
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
                     /* try again with a slower block transfer speed */
                     if (mmapDebug >= 1)
                         printf ("mmapWrite %s %s: block transfer mode %s failed. trying slower speed\n",
                             user, device->name, dmaModeStr[device->maxDmaSpeed]);
-                    dataWidth = dmaModes[--device->maxDmaSpeed];
+                    device->maxDmaSpeed--;
                     continue;
                 }
                 if (dmaStatus == DMA_DONE)
@@ -364,15 +350,15 @@ int mmapWrite(
                    * queue full
                    * unaligned access (already checked before)
                 */
-                if (mmapDebug >= 1) printf ("mmapWrite %s %s: block transfer mode %x failed\n",
-                    user, device->name, dataWidth);
+                if (mmapDebug >= 1) printf ("mmapWrite %s %s: block transfer mode %s failed\n",
+                    user, device->name, dmaModeStr[device->maxDmaSpeed]);
                 break;
             }
         }
     }
 noDmaWrite:    
 #endif /* HAVE_DMA */ 
-    if (mmapDebug >= 1) printf ("mmapWrite %s %s: transfer from %p to %p, %"Z"d * %d bit\n",
+    if (mmapDebug >= 1) printf ("mmapWrite %s %s: transfer from %p to %p, 0x%"Z"x * %d bit\n",
         user, device->name, pdata, dst, nelem, dlen*8);
     regDevCopy(dlen, nelem, pdata, dst, pmask, 0);
     SYNC
@@ -417,6 +403,16 @@ void mmapInterrupt(void *arg)
     }
     scanIoRequest(device->ioscanpvt);
 }
+
+#ifdef HAVE_dmaAlloc
+void* mmapDmaAlloc(
+    regDevice *device,
+    void* old,
+    size_t size)
+{
+    return dmaRealloc(old, size);
+}
+#endif
 
 /****** startup script configuration function ***********************/
 
@@ -663,11 +659,12 @@ int mmapConfigure(
     
 #ifdef HAVE_DMA
     device->maxDmaSpeed=-1;
+    if (vmespace > 0)
     {
         int i;
-        for (i = sizeof(dmaModes)/sizeof(dmaModes[0]); i >= 0; i--)
+        for (i = sizeof(dmaModes)/sizeof(dmaModes[0]) - 1; i >= 0; i--)
         {
-            if (dmaProtocolSupport(dmaModes[i]) == OK)
+            if (dmaProtocolSupport(dmaModes[i]) == 0)
             {
                 device->maxDmaSpeed = i;
                 if (mmapDebug) printf ("mmapConfigure %s: maxDmaSpeed=%s\n",
@@ -676,7 +673,7 @@ int mmapConfigure(
             }
         }
     }
-    device->dmaComplete = semBCreate(SEM_Q_FIFO, SEM_EMPTY);
+    device->dmaComplete = epicsEventMustCreate(epicsEventEmpty);
 #endif /* HAVE_DMA */
 
     if (intrvector)
@@ -698,6 +695,10 @@ int mmapConfigure(
         scanIoInit(&device->ioscanpvt);
     }
     regDevRegisterDevice(name, &mmapSupport, device, size);
+#ifdef HAVE_dmaAlloc
+    if (vmespace > 0)
+        regDevRegisterDmaAlloc(device, mmapDmaAlloc);
+#endif
     return 0;
 }
 

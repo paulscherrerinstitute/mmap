@@ -40,14 +40,12 @@
 #endif /* else EPICS_3_14 */
 
 /* Try to find dma support */
+#ifdef vxWorks
 #define HAVE_DMA
 #include <dmaLib.h>
-#ifdef HAVE_DMA
- #ifdef vxWorks
-  #include <semLib.h>
-  #include <sysLib.h>
- #endif /* vxWorks */
-#endif /* HAVE_DMA */
+#include <semLib.h>
+#include <sysLib.h>
+#endif /* vxWorks */
 
 #if defined (__GNUC__) && defined (_ARCH_PPC)
  #define SYNC __asm__("eieio;sync");
@@ -536,7 +534,7 @@ int mmapConfigure(
     {
         struct stat sb;
         int fd;
-        off_t mapstart;
+        unsigned long mapstart;
         size_t mapsize;
         
         if (mmapDebug) printf ("mmapConfigure %s: mmap to %s\n",
@@ -567,9 +565,9 @@ int mmapConfigure(
         /* check (regular) file size (if we cannot let's just hope for the best) and grow if necessary */
         if (fstat(fd, &sb) != -1)
         {
-            if ((sb.st_mode & S_IFREG) && mapsize + mapstart > sb.st_size)
+            if ((sb.st_mode & S_IFREG) && mapsize + mapstart > (size_t)sb.st_size)
             {
-                if (mmapDebug) printf ("mmapConfigure %s: growing %s from %ld to %ld bytes\n",
+                if (mmapDebug) printf ("mmapConfigure %s: growing %s from %lu to %lu bytes\n",
                     name, addrspace, sb.st_size, mapsize + mapstart);
                 if (ftruncate(fd, mapsize + mapstart) == -1)
                 {

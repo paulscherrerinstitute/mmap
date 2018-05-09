@@ -7,4 +7,7 @@ include /ioc/tools/driver.makefile
 BUILDCLASSES += Linux
 INCLUDES += -I../include/$(T_A) -I../include/$(OS_CLASS) -I../include
 
+# make sure not to pull in pev
+IGNORE_MODULES=pev
+
 endif

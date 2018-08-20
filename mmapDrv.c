@@ -11,6 +11,7 @@
 #ifdef __unix
  #include <sys/mman.h>
  #include <sys/stat.h>
+ #include <sys/sysmacros.h>
  #define HAVE_MMAP
 #endif /*__unix */
 
@@ -21,6 +22,8 @@
  #include <epicsThread.h>
  #include <epicsExport.h>
  #include <epicsEvent.h>
+ #include <epicsMutex.h>
+ #include <epicsFindSymbol.h>
 #else /* 3.13 is vxWorks only */
  #include <sysLib.h>
  #include <intLib.h>
@@ -41,7 +44,11 @@
 
 /* Try to find dma support */
 #ifdef vxWorks
+#include <version.h>
+#ifndef _WRS_VXWORKS_MAJOR
+/* vxWorks 5 */
 #define HAVE_DMA
+#endif
 #include <dmaLib.h>
 #include <semLib.h>
 #include <sysLib.h>
@@ -53,10 +60,17 @@
  #define SYNC
 #endif
 
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
 #define MAGIC 2661166104U /* crc("mmap") */
 
 static char cvsid_mmapDrv[] __attribute__((unused)) =
     "$Id: mmapDrv.c,v 1.18 2015/06/25 14:57:42 zimoch Exp $";
+
+#define INTR_NONE  0
+#define INTR_UIO  -2
 
 struct regDevice {
     unsigned long magic;
@@ -64,18 +78,20 @@ struct regDevice {
     volatile char* localbaseaddress;
     int vmespace;
     unsigned int baseaddress;
-    unsigned int intrvector;
-    unsigned int intrlevel;
+    char* intrsource;
+    int intrvector;
+    int intrlevel;
     int (*intrhandler)(regDevice *device);
     void* userdata;
     IOSCANPVT ioscanpvt;
-    int intrcount;
-    int flags;
+    unsigned long intrcount;
+    unsigned int flags;
+    char* devtype;
+    char* addrspace;
 #ifdef HAVE_DMA
     int maxDmaSpeed;
     epicsEventId dmaComplete;
 #endif
-    char* addrspace;
 };
 
 int mmapDebug = 0;
@@ -86,37 +102,280 @@ int mmapDebug = 0;
 
 /******** Support functions *****************************/ 
 
+typedef struct mmapIntrInfo {
+    struct mmapIntrInfo* next;
+    regDevice *device;
+    IOSCANPVT ioscanpvt;
+    int intrvector;
+    int intrlevel;
+} mmapIntrInfo;
+static mmapIntrInfo* intrInfos = NULL;
+static epicsMutexId mmapConnectInterruptLock;
+
+void mmapInterrupt(void *arg)
+{
+    mmapIntrInfo *info = arg;
+    regDevice *device = info->device;
+    device->intrcount++;
+    if (mmapDebug >= 2) printf ("mmapInterrupt %s: count = %lu, %s\n",
+        device->name, device->intrcount, device->intrhandler ? "calling handler" : "no handler installed");
+    if (device->intrhandler)
+    {
+        if (device->intrhandler(device) != 0) return;
+    }
+    scanIoRequest(info->ioscanpvt);
+}
+
+#ifdef HAVE_MMAP
+
+void mmapUioInterruptThread(void* arg)
+{
+    mmapIntrInfo *info = arg;
+    regDevice *device = info->device;
+    int fd;
+    int n;
+    epicsUInt32 intrno = 0;
+    epicsUInt32 reenable = 1;
+    int lastnum = 0;
+    long missed = 0;
+    char devname[9+sizeof(info->intrvector)*2+sizeof(info->intrvector)/2];
+    
+    sprintf(devname, "/dev/uio%u", info->intrvector);
+    
+    if (mmapDebug) printf ("mmapUioInterruptThread %s: Starting interrupt handling on %s\n",
+        device->name, devname);
+    
+    fd = open(devname, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+    {
+        fd = open(devname, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+        {
+            epicsMutexUnlock(mmapConnectInterruptLock);
+            errlogSevPrintf(errlogFatal,
+                "mmapUioInterruptThread %s: Cannot open %s: %s\n",
+                device->name, devname, strerror(errno));
+            return;
+        }
+    }
+    
+    if (write(fd, &reenable, 4) == -1)
+    {
+        if (mmapDebug) printf ("mmapUioInterruptThread %s: %s does not need re-enable\n",
+            device->name, devname);
+        reenable = 0;
+    }
+    while ((n=read(fd, &intrno, 4)) != -1)
+    {
+        if (mmapDebug >= 2) printf ("mmapUioInterruptThread %s: interrupt number %u (%d bytes read)\n",
+            device->name, n, intrno);
+            
+        if (intrno != lastnum+1)
+        {
+            missed++;
+            if (mmapDebug >= 1) printf ("mmapUioInterruptThread %s: missed %ld interrupts so far\n",
+                device->name, missed);
+        }
+        lastnum = intrno;
+           
+        mmapInterrupt(arg);
+        if (reenable) write(fd, &reenable, 4);
+    }
+    errlogSevPrintf(errlogFatal,
+        "mmapUioInterruptThread %s: Interrupt handling %s working on %s.\n",
+        device->name, intrno ? "stopped" : "not", devname);
+    close(fd);
+}
+
+mmapIntrInfo *mmapConnectUioInterrupt(regDevice *device, int uionum)
+{
+    mmapIntrInfo *info;
+    
+    if (mmapDebug) printf ("mmapConnectUioInterrupt %s: uionum = %d\n",
+        device->name, uionum);
+    
+    info = calloc(sizeof(mmapIntrInfo), 1);
+    if (info)
+    {
+        info->device = device;
+        info->intrlevel = INTR_UIO;
+        info->intrvector = uionum;
+        scanIoInit(&info->ioscanpvt);
+        if (info->ioscanpvt)
+        {
+            char threadname[9+sizeof(uionum)*2+sizeof(uionum)/2];
+            sprintf(threadname, "intr-uio%u", uionum);
+            if (epicsThreadCreate(threadname, epicsThreadPriorityMax, 
+                epicsThreadGetStackSize(epicsThreadStackSmall),
+                mmapUioInterruptThread, info))
+            {
+                return info;
+            }
+        }
+        free(info);
+    }
+    errlogSevPrintf(errlogFatal,
+        "mmapConnectUioInterrupt %s: cannot start uio interrupt handler thread: %s\n",
+        device->name, strerror(errno));
+    return NULL;
+}
+#endif
+
+mmapIntrInfo *mmapConnectVmeInterrupt(regDevice *device, int intrvector, int intrlevel)
+{
+    mmapIntrInfo *info;
+    
+    if (mmapDebug) printf ("mmapConnectVmeInterrupt %s: intrvector = %d intrlevel = %d\n",
+        device->name, intrvector, intrlevel);
+
+    if (intrvector >= 256)
+    {
+        errlogSevPrintf(errlogFatal,
+            "mmapConnectVmeInterrupt %s: illegal VME interrupt vector number %i\n",
+            device->name, intrvector);
+        return NULL;
+    }
+    
+    if (intrlevel < 1 || intrlevel > 7)
+    {
+        errlogSevPrintf(errlogFatal,
+            "mmapConnectVmeInterrupt %s: illegal VME interrupt level number %i\n",
+            device->name, intrvector);
+        return NULL;
+    }
+    
+    info = calloc(sizeof(mmapIntrInfo), 1);
+    if (info)
+    {
+        info->device = device;
+        info->intrlevel = intrlevel;
+        info->intrvector = intrvector;
+        scanIoInit(&info->ioscanpvt);
+        if (info->ioscanpvt)
+        {
+            if (devConnectInterrupt(intVME, intrvector, mmapInterrupt, info) != 0)
+            {
+                epicsMutexUnlock(mmapConnectInterruptLock);
+                errlogSevPrintf(errlogFatal,
+                    "mmapConfigure %s: cannot connect to interrupt vector %d\n",
+                    device->name, intrvector);
+                free(info);
+                return NULL;
+            }
+            if (devEnableInterruptLevel(intVME, intrlevel) != 0)
+            {
+                epicsMutexUnlock(mmapConnectInterruptLock);
+                errlogSevPrintf(errlogMajor,
+                    "mmapConfigure %s: cannot enable interrupt level %d\n",
+                    device->name, intrlevel);
+            }
+            return info;
+        }
+        free(info);
+    }
+    epicsMutexUnlock(mmapConnectInterruptLock);
+    errlogSevPrintf(errlogFatal,
+        "mmapConnectUioInterrupt %s: cannot initialize interrupts: %s\n",
+        device->name, strerror(errno));
+    return NULL;
+}
+
 void mmapReport(
     regDevice *device,
     int level)
 {
     if (device && device->magic == MAGIC)
     {
-        printf("mmap %s:0x%x @%p\n",
-            device->addrspace, device->baseaddress, device->localbaseaddress);
+        if (device->localbaseaddress)
+            printf("mmap %s:0x%x @%p\n",
+                device->addrspace, device->baseaddress, device->localbaseaddress);
+        else
+            printf("mmap %s (no map, interrupt only)\n", device->addrspace);
         if (level > 0)
         {
-            printf("        Interrupt level %d vector %d count: %d\n",
-                device->intrlevel, device->intrvector, device->intrcount);
+            printf("        Interrupt vector %d count: %lu\n",
+                device->intrvector, device->intrcount);
         }
     }
 }
 
+#ifdef __linux__
+int mmapDevTypeToStr(int dev, char* pdevname)
+{
+    char devtype[32];
+    FILE* devices = fopen("/proc/devices", "r");
+    if (devices)
+    {
+        unsigned int devnum;
+
+        fscanf(devices, "Character devices:");
+        while (fscanf(devices, "%u %31s", &devnum, devtype) == 2)
+        {
+            if (devnum == dev)
+            {
+                fclose(devices);
+                strcpy(pdevname, devtype);
+                return 1;
+            }
+        }
+        fclose(devices);
+    }
+    pdevname[0] = 0;
+    return 0;
+}
+#endif
+
 IOSCANPVT mmapGetInScanPvt(
     regDevice *device,
-    size_t offset,
-    unsigned int dlen,
-    size_t nelem,
-    int intvec,
+    size_t offset __attribute__((unused)),
+    unsigned int dlen __attribute__((unused)),
+    size_t nelm __attribute__((unused)),
+    int intrvector,
     const char* user)
 {
+    mmapIntrInfo *info, **pinfo;
+    int intrlevel = device->intrlevel;
+
     if (!device || device->magic != MAGIC)
     { 
         errlogSevPrintf(errlogMajor,
             "mmapGetInScanPvt: illegal device handle\n");
         return NULL;
     }
-    return device->ioscanpvt;
+    if (mmapDebug) printf("mmapGetInScanPvt %s: devtype = %s intrvector = %i device->intrvector = %d intrlevel = %d device->intrsource = %s\n",
+        device->name, device->devtype, intrvector, device->intrvector, intrlevel, device->intrsource);
+    
+    if (intrvector < 0)
+    {
+        intrvector = device->intrvector;
+        if (intrvector < 0) return NULL;
+    }
+
+    pinfo = &intrInfos;
+again:
+    while ((info=(*pinfo)) != NULL)
+    {
+        if (info->intrlevel == intrlevel && info->intrvector == intrvector)
+            return info->ioscanpvt;
+        pinfo = &info->next;
+    }
+    epicsMutexMustLock(mmapConnectInterruptLock);
+    if (*pinfo)
+    {
+        /* someone added something while we were sleeping */
+        epicsMutexUnlock(mmapConnectInterruptLock);
+        goto again;
+    }
+#ifdef HAVE_MMAP
+    if (intrlevel == INTR_UIO)
+        info = mmapConnectUioInterrupt(device, intrvector);
+#endif
+    if (intrlevel >= 1 && intrlevel <= 7)
+        info = mmapConnectVmeInterrupt(device, intrvector, intrlevel);
+    *pinfo = info;
+    epicsMutexUnlock(mmapConnectInterruptLock);
+    if (!info) return NULL;
+    return info->ioscanpvt;
 }
 
 #define mmapGetOutScanPvt mmapGetInScanPvt
@@ -150,6 +409,19 @@ int mmapRead(
             "mmapRead %s: illegal device handle\n", user);
         return -1;
     }
+    if (!device->localbaseaddress)
+    {
+/*
+        if (offset == 0)
+        {
+            regDevCopy(dlen, 1, device->intrcount, pdata, NULL, 0);
+            return 0;
+        }
+*/
+        errlogSevPrintf(errlogMajor,
+            "mmapRead %s: device without a map\n", user);
+        return -1;
+    }
     
     src = device->localbaseaddress+offset;
 #ifdef HAVE_DMA
@@ -176,7 +448,7 @@ int mmapRead(
             default:
                 goto noDmaRead;
         }
-        if (mmapDebug >= 1) printf ("mmapRead %s %s: block transfer from %p to %p, 0x%"Z"x * %d bit\n",
+        if (mmapDebug) printf ("mmapRead %s %s: block transfer from %p to %p, 0x%"Z"x * %d bit\n",
             user, device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
         while (1)
         {
@@ -202,7 +474,7 @@ int mmapRead(
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
                     /* try again with a slower block transfer speed */
-                    if (mmapDebug >= 1)
+                    if (mmapDebug)
                         printf ("mmapRead %s %s: block transfer mode %s failed. trying slower speed\n",
                             user, device->name, dmaModeStr[device->maxDmaSpeed]);
                     device->maxDmaSpeed--;
@@ -229,7 +501,7 @@ int mmapRead(
                    * queue full
                    * unaligned access (already checked before)
                 */
-                if (mmapDebug >= 1) printf ("mmapRead %s %s: block transfer mode %s failed\n",
+                if (mmapDebug) printf ("mmapRead %s %s: block transfer mode %s failed\n",
                     user, device->name, dmaModeStr[device->maxDmaSpeed]);
                 break;
             }
@@ -237,7 +509,7 @@ int mmapRead(
     }
 noDmaRead:    
 #endif /* HAVE_DMA */ 
-    if (mmapDebug >= 1) printf ("mmapRead %s %s: normal transfer from %p to %p, 0x%"Z"x * %d bit\n",
+    if (mmapDebug) printf ("mmapRead %s %s: normal transfer from %p to %p, 0x%"Z"x * %d bit\n",
         user, device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
     regDevCopy(dlen, nelem, src, pdata, NULL, 0);
     return 0;
@@ -268,7 +540,13 @@ int mmapWrite(
             "mmapWrite %s %s: device is read-only\n", user, device->name);
         return -1;
     }
-
+    if (!device->localbaseaddress)
+    {
+        errlogSevPrintf(errlogMajor,
+            "mmapWrite %s: device without a map\n", user);
+        return -1;
+    }
+    
     dst = device->localbaseaddress+offset;
 #ifdef HAVE_DMA
     /* Try block transfer for long arrays */
@@ -295,7 +573,7 @@ int mmapWrite(
             default:
                 goto noDmaWrite;
         }
-        if (mmapDebug >= 1) printf ("mmapWrite %s %s: block transfer from %p to %p, 0x%"Z"x * %d bit\n",
+        if (mmapDebug) printf ("mmapWrite %s %s: block transfer from %p to %p, 0x%"Z"x * %d bit\n",
             user, device->name, pdata, device->localbaseaddress+offset, nelem, dlen*8);
         while (1)
         {
@@ -321,7 +599,7 @@ int mmapWrite(
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
                     /* try again with a slower block transfer speed */
-                    if (mmapDebug >= 1)
+                    if (mmapDebug)
                         printf ("mmapWrite %s %s: block transfer mode %s failed. trying slower speed\n",
                             user, device->name, dmaModeStr[device->maxDmaSpeed]);
                     device->maxDmaSpeed--;
@@ -348,7 +626,7 @@ int mmapWrite(
                    * queue full
                    * unaligned access (already checked before)
                 */
-                if (mmapDebug >= 1) printf ("mmapWrite %s %s: block transfer mode %s failed\n",
+                if (mmapDebug) printf ("mmapWrite %s %s: block transfer mode %s failed\n",
                     user, device->name, dmaModeStr[device->maxDmaSpeed]);
                 break;
             }
@@ -356,7 +634,7 @@ int mmapWrite(
     }
 noDmaWrite:    
 #endif /* HAVE_DMA */ 
-    if (mmapDebug >= 1) printf ("mmapWrite %s %s: transfer from %p to %p, 0x%"Z"x * %d bit\n",
+    if (mmapDebug) printf ("mmapWrite %s %s: transfer from %p to %p, 0x%"Z"x * %d bit\n",
         user, device->name, pdata, dst, nelem, dlen*8);
     regDevCopy(dlen, nelem, pdata, dst, pmask, 0);
     SYNC
@@ -389,19 +667,6 @@ int mmapIntAckClearBits16(regDevice *device)
     return 0;
 }
 
-void mmapInterrupt(void *arg)
-{
-    regDevice *device = (regDevice *)arg;
-    device->intrcount++;
-    if (mmapDebug >= 1) printf ("mmapInterrupt %s: count = %d, %s\n",
-        device->name, device->intrcount, device->intrhandler ? "calling handler" : "no handler installed");
-    if (device->intrhandler)
-    {
-        if (device->intrhandler(device) != 0) return;
-    }
-    scanIoRequest(device->ioscanpvt);
-}
-
 #ifdef HAVE_dmaAlloc
 void* mmapDmaAlloc(
     regDevice *device,
@@ -418,32 +683,42 @@ int mmapConfigure(
     const char* name,
     unsigned int baseaddress,
     unsigned int size,
-#ifdef __vxworks
+#ifdef vxWorks
     int addrspace,   /* int for compatibility with earliner versions */
+    int intrvector,
 #define ADDRSPACEFMT "%d"
+#define INTRFMT "%d"
 #else
     char* addrspace,
+    char* intrsource,
 #define ADDRSPACEFMT "%s"
+#define INTRFMT "%s"
 #endif
-    unsigned int intrvector,
-    unsigned int intrlevel,
-    int (*intrhandler)(regDevice *device),
+    int intrlevel,
+    int (*intrhandler)(regDevice *),
     void* userdata)
 {
     regDevice* device;
-    char* localbaseaddress;
+    char* localbaseaddress = NULL;
     int vmespace=-2;
     int flags=0;
+    char devtype[32] = "";
+#ifdef vxWorks
+    char intrsource[12] = "";
+#else
+    int intrvector = -1;
+    struct stat sb;
+#endif
 
-    if (name == NULL || size == 0)
+    if (name == NULL)
     {
-        printf("usage: mmapConfigure(\"name\", baseaddress, size, addrspace, ivec, ilvl)\n");
+        printf("usage: mmapConfigure(\"name\", baseaddress, size, addrspace, intrvector, ilvl)\n");
         printf("maps register block to device \"name\"\n");
         printf("\"name\" must be a unique string on this IOC\n");
 #ifdef HAVE_MMAP
         printf("addrspace: device used for mapping (default: /dev/mem)\n");
 #endif
-#ifdef __vxworks
+#ifdef vxWorks
         printf("addrspace = 0xc, 16, 24 or 32: VME address space (0xc means CSR)"
 #else
         printf("addrspace = csr, 16, 24 or 32: VME address space"
@@ -455,9 +730,57 @@ int mmapConfigure(
         printf("addrspace = sim: simulation on allocated memory\n");
         return 0;
     }
-#ifdef __vxworks
+    
+    if (!mmapConnectInterruptLock)
+        mmapConnectInterruptLock = epicsMutexMustCreate();
+    
+#ifdef vxWorks
+    if (intrvector > 0 && intrvector < 256)
+        sprintf("vme vec %i", intrsource, intrvector);
+    else
+        intrvector = -1;
     vmespace = addrspace;
 #else
+    if (intrsource && intrsource[0])
+    {
+        char *end;
+        intrvector = strtol(intrsource, &end, 0);
+        if (end == intrsource)
+        {
+            intrvector = -1;
+#ifdef HAVE_MMAP
+            if (mmapDebug) printf ("mmapConfigure %s: intrvector = %d, intrsource = %s\n",
+                name, intrvector, intrsource);    
+            if (intrsource && intrsource[0])
+            {
+                char intrdevtype[32];
+
+                if (mmapDebug) printf ("mmapConfigure %s: checking type of %s\n",
+                    name, intrsource);
+                if (stat(intrsource, &sb) != -1 &&
+                    mmapDevTypeToStr(major(sb.st_rdev), intrdevtype))
+                {
+                    if (mmapDebug) printf ("mmapConfigure %s: %s is a %s device\n",
+                        name, intrsource, intrdevtype);
+                    if (strcmp(intrdevtype, "uio") == 0)
+                    {
+                        intrvector = minor(sb.st_rdev);
+                        intrlevel = INTR_UIO;
+                        if (mmapDebug) printf ("mmapConfigure %s: default interrupts from uio%d\n",
+                            name, intrvector);
+                    }
+                }
+                else
+                {
+                    errlogSevPrintf(errlogMajor,
+                        "mmapConfigure %s: Don't know how to handle interrupts from %s\n",
+                            name, intrsource);
+                }
+            }
+#endif
+        }
+    }
+    
     if (!addrspace || !addrspace[0]) { addrspace="/dev/mem"; }
     sscanf (addrspace, "%i", &vmespace);
     if (strcmp(addrspace, "csr") == 0) { vmespace = 0xc; }
@@ -532,7 +855,6 @@ int mmapConfigure(
 #ifdef HAVE_MMAP
     else 
     {
-        struct stat sb;
         int fd;
         unsigned long mapstart;
         size_t mapsize;
@@ -545,11 +867,11 @@ int mmapConfigure(
         mapsize = size + (baseaddress - mapstart);
 
         /* first try to open read/write, create if necessary (and possible) */
-        fd = open(addrspace, O_RDWR | O_CREAT, 0777);
+        fd = open(addrspace, O_RDWR | O_CREAT | O_CLOEXEC, 0777);
         if (fd < 0)
         {
             /* cannot open R/W or cannot create: try to open readonly */
-            fd = open(addrspace, O_RDONLY);
+            fd = open(addrspace, O_RDONLY | O_CLOEXEC);
             if (fd < 0)
             {
                 errlogSevPrintf(errlogFatal,
@@ -561,55 +883,85 @@ int mmapConfigure(
             if (mmapDebug) printf ("mmapConfigure %s: %s is readonly\n",
                 name, addrspace);
         }
+        if (mmapDebug) printf ("mmapConfigure %s: %s gets fd %d\n",
+            name, addrspace, fd);
         
         /* check (regular) file size (if we cannot let's just hope for the best) and grow if necessary */
         if (fstat(fd, &sb) != -1)
         {
-            if ((sb.st_mode & S_IFREG) && mapsize + mapstart > (size_t)sb.st_size)
+            if (S_ISREG(sb.st_mode) && mapsize + mapstart > (size_t)sb.st_size)
             {
                 if (mmapDebug) printf ("mmapConfigure %s: growing %s from %lu to %lu bytes\n",
                     name, addrspace, sb.st_size, mapsize + mapstart);
                 if (ftruncate(fd, mapsize + mapstart) == -1)
                 {
-                    errlogSevPrintf(errlogFatal,
-                        "mmapConfigure %s: %s too small and cannot grow: %s\n",
-                        name, addrspace, strerror(errno));
-                    close(fd);
-                    return errno;
+                    if (mapstart >= (size_t)sb.st_size)
+                    {
+                        errlogSevPrintf(errlogFatal,
+                            "mmapConfigure %s: %s too small and cannot grow (start > size): %s\n",
+                            name, addrspace, strerror(errno));
+                        close(fd);
+                        return errno;
+                    }
+                    else
+                    {
+                        size = sb.st_size - baseaddress;
+                        mapsize = sb.st_size - mapstart;
+                        errlogSevPrintf(errlogMajor,
+                            "mmapConfigure %s: %s too small and cannot grow, shrinking size to %u\n",
+                            name, addrspace, size);
+                    }
+                }
+            }
+            if (S_ISCHR(sb.st_mode))
+            {
+                /* test device type if possible */
+                if (mmapDevTypeToStr(major(sb.st_rdev), devtype))
+                {
+                    if (mmapDebug) printf ("mmapConfigure %s: device is %s number %d intrvector = %d\n",
+                        name, devtype, minor(sb.st_rdev), intrvector);
+                    if (strcmp(devtype, "uio") == 0)
+                    {
+                        if (intrvector < 0) intrvector = minor(sb.st_rdev);
+                        intrlevel = INTR_UIO;
+                        if (mmapDebug) printf ("mmapConfigure %s: default interrupts from uio%d\n",
+                            name, intrvector);
+                    }
                 }
             }
         }
         else
+        {
             if (mmapDebug) printf ("mmapConfigure %s: cannot stat %s: %s\n",
                 name, addrspace, strerror(errno));
+        }
 
-        /* map shared with other processes read/write or readonly */
-        if (mmapDebug) printf ("mmapConfigure %s: mmap(NULL, %"Z"u, %s, MAP_SHARED, %d (%s), %ld)\n",
-            name, mapsize, (flags &= READONLY_DEVICE) ? "PROT_READ" : "PROT_READ|PROT_WRITE",
-            fd, addrspace, mapstart);
-            
-        localbaseaddress = mmap(NULL, mapsize,
-            (flags &= READONLY_DEVICE) ? PROT_READ : PROT_READ|PROT_WRITE,
-            MAP_SHARED, fd, mapstart);
+        if (size)
+        {
+            /* map shared with other processes read/write or readonly */
+            if (mmapDebug) printf ("mmapConfigure %s: mmap(NULL, %"Z"u, %s, MAP_SHARED, %d=%s, %ld)\n",
+                name, mapsize, (flags &= READONLY_DEVICE) ? "PROT_READ" : "PROT_READ|PROT_WRITE",
+                fd, addrspace, mapstart);
 
+            localbaseaddress = mmap(NULL, mapsize,
+                (flags &= READONLY_DEVICE) ? PROT_READ : PROT_READ|PROT_WRITE,
+                MAP_SHARED, fd, mapstart);
+            if (localbaseaddress == MAP_FAILED)
+            {
+                errlogSevPrintf(errlogFatal,
+                    "mmapConfigure %s: can't mmap %s: %s\n",
+                    name, addrspace, errno == ENODEV ? "Device does not support mapping" : strerror(errno));
+                return errno;
+            }
+            /* adjust localbaseaddress by the offset within the page */
+            if (mmapDebug) printf ("mmapConfigure %s: mmap returned %p, adjusting by %ld bytes\n",
+                name, localbaseaddress, baseaddress - mapstart);
+            localbaseaddress += (baseaddress - mapstart);
+        }
         /* we don't need the file descriptor any more */
         close(fd);
-        
-        if (localbaseaddress == MAP_FAILED || localbaseaddress == NULL)
-        {
-            errlogSevPrintf(errlogFatal,
-                "mmapConfigure %s: can't mmap %s: %s\n",
-                name, addrspace, strerror(errno));
-            return errno;
-        }
-        
-        /* adjust localbaseaddress by the offset within the page */
-        if (mmapDebug) printf ("mmapConfigure %s: mmap returned %p, adjusting by %ld bytes\n",
-            name, localbaseaddress, baseaddress - mapstart);
-        localbaseaddress += (baseaddress - mapstart);
     }
 #endif
-
     device = (regDevice*)malloc(sizeof(regDevice));
     if (device == NULL)
     {
@@ -620,14 +972,15 @@ int mmapConfigure(
     }
     device->magic = MAGIC;
     device->name = strdup(name);
+    device->devtype = strdup(devtype);
     device->vmespace = vmespace;
     device->baseaddress = baseaddress;
     device->localbaseaddress = localbaseaddress;
-    device->intrlevel = intrlevel;
+    device->intrsource = intrsource && intrsource[0] ? strdup(intrsource) : NULL;
     device->intrvector = intrvector;
+    device->intrlevel = intrlevel;
     device->intrhandler = intrhandler;
     device->userdata = userdata;
-    device->ioscanpvt = NULL;
     device->intrcount = 0;
     device->flags = flags;
     switch (vmespace)
@@ -647,9 +1000,13 @@ int mmapConfigure(
         case atVMEA32:
             device->addrspace = "A32";
             break;
-#ifndef __vxworks
         default:
+#ifndef vxWorks
             device->addrspace = strdup(addrspace);
+#else
+            errlogSevPrintf(errlogFatal,
+                "mmapConfigure %s: invalid addrspace %d\n",
+                name, addrspace);
 #endif
     }
     if (mmapDebug) printf ("mmapConfigure %s: vmespace = %d addrspace = %s\n",
@@ -674,24 +1031,6 @@ int mmapConfigure(
     device->dmaComplete = epicsEventMustCreate(epicsEventEmpty);
 #endif /* HAVE_DMA */
 
-    if (intrvector)
-    {
-        if (devConnectInterrupt(intVME, intrvector, mmapInterrupt, device) != 0)
-        {
-            errlogSevPrintf(errlogFatal,
-                "vmemapConfigure %s: cannot connect to interrupt vector %d\n",
-                name, intrvector);
-            return -1;
-        }
-        if (devEnableInterruptLevel(intVME, intrlevel) != 0)
-        {
-            errlogSevPrintf(errlogFatal,
-                "vmemapConfigure %s: cannot enable interrupt level %d\n",
-                name, intrlevel);
-            return -1;
-        }
-        scanIoInit(&device->ioscanpvt);
-    }
     regDevRegisterDevice(name, &mmapSupport, device, size);
 #ifdef HAVE_dmaAlloc
     if (vmespace > 0)
@@ -706,15 +1045,16 @@ int mmapConfigure(
 static const iocshArg mmapConfigureArg0 = { "name", iocshArgString };
 static const iocshArg mmapConfigureArg1 = { "baseaddress", iocshArgInt };
 static const iocshArg mmapConfigureArg2 = { "size", iocshArgInt };
-#ifdef __vxworks
+#ifdef vxWorks
 static const iocshArg mmapConfigureArg3 = { "addrspace (-1=simulation; 0xc=CSR; 16,24,32=VME,+100=block transfer)", iocshArgInt };
+static const iocshArg mmapConfigureArg4 = { "intrvector", iocshArgInt };
 #else
 static const iocshArg mmapConfigureArg3 = { "mapped device (sim=simulation; csr,16,24,32=VME; default:/dev/mem)", iocshArgString };
+static const iocshArg mmapConfigureArg4 = { "intrsource", iocshArgString };
 #endif
-static const iocshArg mmapConfigureArg4 = { "intrvector (default:0)", iocshArgInt };
-static const iocshArg mmapConfigureArg5 = { "intrlevel (default:0)", iocshArgInt };
-static const iocshArg mmapConfigureArg6 = { "intrhandler (default:NULL)", iocshArgString };
-static const iocshArg mmapConfigureArg7 = { "userdata (default:NULL)", iocshArgString };
+static const iocshArg mmapConfigureArg5 = { "intrlevel", iocshArgInt };
+static const iocshArg mmapConfigureArg6 = { "intrhandler", iocshArgString };
+static const iocshArg mmapConfigureArg7 = { "userdata", iocshArgString };
 static const iocshArg * const mmapConfigureArgs[] = {
     &mmapConfigureArg0,
     &mmapConfigureArg1,
@@ -733,12 +1073,14 @@ static void mmapConfigureFunc (const iocshArgBuf *args)
 {
     mmapConfigure(
         args[0].sval, args[1].ival, args[2].ival,
-#ifdef __vxworks
-        args[3].ival,
+#ifdef vxWorks
+        args[3].ival, args[4].ival, 
 #else
-        args[3].sval,
+        args[3].sval, args[4].sval, 
 #endif
-        args[4].ival, args[5].ival, NULL, NULL);
+        args[5].ival,
+        args[6].sval ? (int (*)(regDevice *))epicsFindSymbol(args[6].sval) : NULL,
+        args[7].sval);
 }
 
 static void mmapRegistrar ()

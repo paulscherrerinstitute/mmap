@@ -40,6 +40,10 @@
  #define epicsEventWaitOK OK
  #define epicsEventMustCreate(i) semBCreate(SEM_Q_FIFO, i)
  #define epicsEventEmpty SEM_EMPTY
+ #define epicsMutexId SEM_ID
+ #define epicsMutexMustCreate() semMCreate(SEM_DELETE_SAFE|SEM_INVERSION_SAFE|SEM_Q_PRIORITY)
+ #define epicsMutexMustLock(sem) semTake(sem,WAIT_FOREVER)
+ #define epicsMutexUnlock(sem) semGive(sem)
 #endif /* else EPICS_3_14 */
 
 /* Try to find dma support */

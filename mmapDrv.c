@@ -140,7 +140,7 @@ void mmapUioInterruptThread(void* arg)
     int n;
     epicsUInt32 intrno = 0;
     epicsUInt32 reenable = 1;
-    int lastnum = 0;
+    epicsUInt32 lastnum = 0;
     long missed = 0;
     char devname[9+sizeof(info->intrvector)*2+sizeof(info->intrvector)/2];
     
@@ -304,7 +304,7 @@ void mmapReport(
 }
 
 #ifdef __linux__
-int mmapDevTypeToStr(int dev, char* pdevname)
+int mmapDevTypeToStr(unsigned int dev, char* pdevname)
 {
     char devtype[32];
     FILE* devices = fopen("/proc/devices", "r");

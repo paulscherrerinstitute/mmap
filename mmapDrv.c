@@ -1071,7 +1071,7 @@ static const iocshArg * const mmapConfigureArgs[] = {
 };
 
 static const iocshFuncDef mmapConfigureDef =
-    { "mmapConfigure", 6, mmapConfigureArgs };
+    { "mmapConfigure", 8, mmapConfigureArgs };
     
 static void mmapConfigureFunc (const iocshArgBuf *args)
 {

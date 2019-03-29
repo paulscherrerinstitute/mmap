@@ -15,7 +15,7 @@
  #define HAVE_MMAP
 #endif /*__unix */
 
-#ifdef EPICS_3_14
+#ifndef EPICS_3_13
  #include <errlog.h>
  #include <devLibVME.h>
  #include <epicsTypes.h>
@@ -44,7 +44,7 @@
  #define epicsMutexMustCreate() semMCreate(SEM_DELETE_SAFE|SEM_INVERSION_SAFE|SEM_Q_PRIORITY)
  #define epicsMutexMustLock(sem) semTake(sem,WAIT_FOREVER)
  #define epicsMutexUnlock(sem) semGive(sem)
-#endif /* else EPICS_3_14 */
+#endif /* EPICS_3_13 */
 
 /* Try to find dma support */
 #ifdef vxWorks
@@ -817,7 +817,7 @@ int mmapConfigure(
                     name, addrspace);
                 return -1;
         }
-#ifdef EPICS_3_14
+#ifndef EPICS_3_13
         if (!pdevLibVirtualOS)
         {
             errlogSevPrintf(errlogFatal,
@@ -830,9 +830,9 @@ int mmapConfigure(
         devRegisterAddress(NULL, 0, 0, 0, NULL);
 
         if (pdevLibVirtualOS->pDevMapAddr(vmespace, 0, baseaddress, size, (volatile void **)(volatile char **)&localbaseaddress) != 0)
-#else
+#else /* EPICS_3_13 */
         if (sysBusToLocalAdrs(vmespace, (char*)baseaddress, &localbaseaddress) != OK)
-#endif
+#endif /* EPICS_3_13 */
         {
             errlogSevPrintf(errlogFatal,
                 "mmapConfigure %s: can't map address 0x%08x on "
@@ -1043,7 +1043,7 @@ int mmapConfigure(
     return 0;
 }
 
-#ifdef EPICS_3_14
+#ifndef EPICS_3_13
 
 #include <iocsh.h>
 static const iocshArg mmapConfigureArg0 = { "name", iocshArgString };
@@ -1094,4 +1094,4 @@ static void mmapRegistrar ()
 
 epicsExportRegistrar(mmapRegistrar);
 
-#endif
+#endif /* !EPICS_3_13 */

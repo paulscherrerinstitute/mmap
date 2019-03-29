@@ -42,7 +42,7 @@
  #define epicsEventEmpty SEM_EMPTY
  #define epicsMutexId SEM_ID
  #define epicsMutexMustCreate() semMCreate(SEM_DELETE_SAFE|SEM_INVERSION_SAFE|SEM_Q_PRIORITY)
- #define epicsMutexMustLock(sem) semTake(sem,WAIT_FOREVER)
+ #define epicsMutexMustLock(sem) semTake(sem, WAIT_FOREVER)
  #define epicsMutexUnlock(sem) semGive(sem)
 #endif /* EPICS_3_13 */
 
@@ -52,7 +52,7 @@
 #ifndef _WRS_VXWORKS_MAJOR
 /* vxWorks 5 */
 #define HAVE_DMA
-#endif
+#endif /* vxWorks 5 */
 #include <dmaLib.h>
 #include <semLib.h>
 #include <sysLib.h>
@@ -60,13 +60,13 @@
 
 #if defined (__GNUC__) && defined (_ARCH_PPC)
  #define SYNC __asm__("eieio;sync");
-#else
+#else /* !_ARCH_PPC */
  #define SYNC
-#endif
+#endif /* !_ARCH_PPC */
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
-#endif
+#endif /* O_CLOEXEC */
 
 #define MAGIC 2661166104U /* crc("mmap") */
 
@@ -96,7 +96,7 @@ struct regDevice {
 #ifdef HAVE_DMA
     int maxDmaSpeed;
     epicsEventId dmaComplete;
-#endif
+#endif /* HAVE_DMA */
 };
 
 int mmapDebug = 0;
@@ -223,7 +223,7 @@ mmapIntrInfo *mmapConnectUioInterrupt(regDevice *device, int uionum)
         device->name, strerror(errno));
     return NULL;
 }
-#endif
+#endif /* HAVE_MMAP */
 
 mmapIntrInfo *mmapConnectVmeInterrupt(regDevice *device, int intrvector, int intrlevel)
 {
@@ -327,7 +327,7 @@ int mmapDevTypeToStr(unsigned int dev, char* pdevname)
     pdevname[0] = 0;
     return 0;
 }
-#endif
+#endif /* __linux__ */
 
 IOSCANPVT mmapGetInScanPvt(
     regDevice *device,
@@ -373,7 +373,7 @@ again:
 #ifdef HAVE_MMAP
     if (intrlevel == INTR_UIO)
         info = mmapConnectUioInterrupt(device, intrvector);
-#endif
+#endif /* HAVE_MMAP */
     if (intrlevel >= 1 && intrlevel <= 7)
         info = mmapConnectVmeInterrupt(device, intrvector, intrlevel);
     *pinfo = info;
@@ -392,7 +392,7 @@ void mmapCancelDma(int handle)
 {
     dmaRequestCancel(handle, FALSE);
 }
-#endif
+#endif /* HAVE_DMA */
 
 
 int mmapRead(
@@ -460,7 +460,7 @@ int mmapRead(
             if (dmaTransferRequest(pdata, (unsigned char*) src, nelem*dlen,
                     addrMode, dmaModes[device->maxDmaSpeed], V2C, 100, NULL, NULL, &dmaStatus) != -1)
             {
-#else
+#else /* !dmaTransferRequest_can_wait */
             int dmaHandle;
             if ((dmaHandle = dmaTransferRequest(pdata, (unsigned char*) src, nelem*dlen,
                     addrMode, dmaModes[device->maxDmaSpeed], V2C, 100,
@@ -474,7 +474,7 @@ int mmapRead(
                             user, device->name);
                     return -1;
                 }
-#endif
+#endif /* !dmaTransferRequest_can_wait */
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
                     /* try again with a slower block transfer speed */
@@ -585,7 +585,7 @@ int mmapWrite(
             if ((dmaStatus = dmaTransferRequest((unsigned char*) dst, pdata, nelem*dlen,
                     addrMode, dmaModes[device->maxDmaSpeed], C2V, 100, NULL, NULL, &dmaStatus)) != -1)
             {
-#else
+#else /* !dmaTransferRequest_can_wait */
             int dmaHandle;
             if ((dmaHandle = dmaTransferRequest((unsigned char*) dst, pdata, nelem*dlen,
                     addrMode, dmaModes[device->maxDmaSpeed], C2V, 100,
@@ -599,7 +599,7 @@ int mmapWrite(
                             user, device->name);
                     return -1;
                 }
-#endif
+#endif /* !dmaTransferRequest_can_wait */
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
                     /* try again with a slower block transfer speed */
@@ -679,7 +679,7 @@ void* mmapDmaAlloc(
 {
     return dmaRealloc(old, size);
 }
-#endif
+#endif /* HAVE_dmaAlloc */
 
 /****** startup script configuration function ***********************/
 
@@ -692,12 +692,12 @@ int mmapConfigure(
     int intrvector,
 #define ADDRSPACEFMT "%d"
 #define INTRFMT "%d"
-#else
+#else /* !vxWorks */
     char* addrspace,
     char* intrsource,
 #define ADDRSPACEFMT "%s"
 #define INTRFMT "%s"
-#endif
+#endif /* !vxWorks */
     int intrlevel,
     int (*intrhandler)(regDevice *),
     void* userdata)
@@ -709,10 +709,10 @@ int mmapConfigure(
     char devtype[32] = "";
 #ifdef vxWorks
     char intrsource[12] = "";
-#else
+#else /* !vxWorks */
     int intrvector = -1;
     struct stat sb;
-#endif
+#endif /* !vxWorks */
 
     if (name == NULL)
     {
@@ -721,15 +721,15 @@ int mmapConfigure(
         printf("\"name\" must be a unique string on this IOC\n");
 #ifdef HAVE_MMAP
         printf("addrspace: device used for mapping (default: /dev/mem)\n");
-#endif
+#endif /* HAVE_MMAP */
 #ifdef vxWorks
         printf("addrspace = 0xc, 16, 24 or 32: VME address space (0xc means CSR)"
-#else
+#else /* !vxWorks */
         printf("addrspace = csr, 16, 24 or 32: VME address space"
-#endif
+#endif /* !vxWorks */
 #ifdef HAVE_DMA
                 " (+100: allow block transfer)"
-#endif
+#endif /* HAVE_DMA */
                 "\n");
         printf("addrspace = sim: simulation on allocated memory\n");
         return 0;
@@ -744,7 +744,7 @@ int mmapConfigure(
     else
         intrvector = -1;
     vmespace = addrspace;
-#else
+#else /* !vxWorks */
     if (intrsource && intrsource[0])
     {
         char *end;
@@ -781,7 +781,7 @@ int mmapConfigure(
                             name, intrsource);
                 }
             }
-#endif
+#endif /* HAVE_MMAP */
         }
     }
 
@@ -789,7 +789,7 @@ int mmapConfigure(
     sscanf (addrspace, "%i", &vmespace);
     if (strcmp(addrspace, "csr") == 0) { vmespace = 0xc; }
     if (strcmp(addrspace, "sim") == 0) { vmespace = -1; }
-#endif
+#endif /* !vxWorks */
     if (vmespace > 0)
     {
         flags=vmespace/100;
@@ -965,7 +965,7 @@ int mmapConfigure(
         /* we don't need the file descriptor any more */
         close(fd);
     }
-#endif
+#endif /* HAVE_MMAP */
     device = (regDevice*)malloc(sizeof(regDevice));
     if (device == NULL)
     {
@@ -1007,11 +1007,11 @@ int mmapConfigure(
         default:
 #ifndef vxWorks
             device->addrspace = strdup(addrspace);
-#else
+#else /* !vxWorks */
             errlogSevPrintf(errlogFatal,
                 "mmapConfigure %s: invalid addrspace %d\n",
                 name, addrspace);
-#endif
+#endif /* !vxWorks */
     }
     if (mmapDebug) printf("mmapConfigure %s: vmespace = %d addrspace = %s\n",
         name, vmespace, device->addrspace);
@@ -1039,7 +1039,7 @@ int mmapConfigure(
 #ifdef HAVE_dmaAlloc
     if (vmespace > 0)
         regDevRegisterDmaAlloc(device, mmapDmaAlloc);
-#endif
+#endif /* HAVE_dmaAlloc */
     return 0;
 }
 
@@ -1052,10 +1052,10 @@ static const iocshArg mmapConfigureArg2 = { "size", iocshArgInt };
 #ifdef vxWorks
 static const iocshArg mmapConfigureArg3 = { "addrspace (-1=simulation; 0xc=CSR; 16,24,32=VME,+100=block transfer)", iocshArgInt };
 static const iocshArg mmapConfigureArg4 = { "intrvector", iocshArgInt };
-#else
+#else /* !vxWorks */
 static const iocshArg mmapConfigureArg3 = { "mapped device (sim=simulation; csr,16,24,32=VME; default:/dev/mem)", iocshArgString };
 static const iocshArg mmapConfigureArg4 = { "intrsource", iocshArgString };
-#endif
+#endif /* !vxWorks */
 static const iocshArg mmapConfigureArg5 = { "intrlevel", iocshArgInt };
 static const iocshArg mmapConfigureArg6 = { "intrhandler", iocshArgString };
 static const iocshArg mmapConfigureArg7 = { "userdata", iocshArgString };
@@ -1079,9 +1079,9 @@ static void mmapConfigureFunc (const iocshArgBuf *args)
         args[0].sval, args[1].ival, args[2].ival,
 #ifdef vxWorks
         args[3].ival, args[4].ival,
-#else
+#else /* !vxWorks */
         args[3].sval, args[4].sval,
-#endif
+#endif /* !vxWorks */
         args[5].ival,
         args[6].sval ? (int (*)(regDevice *))epicsFindSymbol(args[6].sval) : NULL,
         args[7].sval);

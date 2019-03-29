@@ -88,7 +88,8 @@ struct regDevice {
     int (*intrhandler)(regDevice *device);
     void* userdata;
     IOSCANPVT ioscanpvt;
-    unsigned long intrcount;
+    unsigned long long intrcount;
+    unsigned long long intrmissed;
     unsigned int flags;
     char* devtype;
     char* addrspace;
@@ -121,7 +122,7 @@ void mmapInterrupt(void *arg)
     mmapIntrInfo *info = arg;
     regDevice *device = info->device;
     device->intrcount++;
-    if (mmapDebug >= 2) printf("mmapInterrupt %s: count = %lu, %s\n",
+    if (mmapDebug >= 2) printf("mmapInterrupt %s: count = %llu, %s\n",
         device->name, device->intrcount, device->intrhandler ? "calling handler" : "no handler installed");
     if (device->intrhandler)
     {
@@ -141,7 +142,6 @@ void mmapUioInterruptThread(void* arg)
     epicsUInt32 intrno = 0;
     epicsUInt32 reenable = 1;
     epicsUInt32 lastnum = 0;
-    long missed = 0;
     char devname[9+sizeof(info->intrvector)*2+sizeof(info->intrvector)/2];
 
     sprintf(devname, "/dev/uio%u", info->intrvector);
@@ -174,11 +174,11 @@ void mmapUioInterruptThread(void* arg)
         if (mmapDebug >= 2) printf("mmapUioInterruptThread %s: interrupt number %u (%d bytes read)\n",
             device->name, n, intrno);
 
-        if (intrno != lastnum+1)
+        if (lastnum && intrno != lastnum+1)
         {
-            missed++;
-            if (mmapDebug >= 1) printf("mmapUioInterruptThread %s: missed %ld interrupts so far\n",
-                device->name, missed);
+            device->intrmissed++;
+            if (mmapDebug >= 1) printf("mmapUioInterruptThread %s: missed %lld interrupts so far\n",
+                device->name, device->intrmissed);
         }
         lastnum = intrno;
 
@@ -295,10 +295,10 @@ void mmapReport(
                 device->addrspace, device->baseaddress, device->localbaseaddress);
         else
             printf("mmap %s (no map, interrupt only)\n", device->addrspace);
-        if (level > 0)
+        if (level > 0 && device->intrvector >= 0)
         {
-            printf("        Interrupt vector %d count: %lu\n",
-                device->intrvector, device->intrcount);
+            printf("     Intr %s count: %llu, missed: %llu\n",
+                device->intrsource, device->intrcount, device->intrmissed);
         }
     }
 }

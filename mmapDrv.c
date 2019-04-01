@@ -46,6 +46,12 @@
  #define epicsMutexUnlock(sem) semGive(sem)
 #endif /* EPICS_3_13 */
 
+#define EPICSVER EPICS_VERSION*10000+EPICS_REVISION*100+EPICS_MODIFICATION
+#if EPICSVER < 31409 || (EPICSVER < 31500 && __STDC_VERSION__ < 199901L)
+typedef long long epicsInt64;
+typedef unsigned long long epicsUInt64;
+#endif
+
 /* Try to find dma support */
 #ifdef vxWorks
 #include <version.h>
@@ -104,6 +110,9 @@ int mmapDebug = 0;
 /* Device flags */
 #define ALLOW_BLOCK_TRANSFER 0x0000001
 #define READONLY_DEVICE      0x0000002
+#define SWAP_BYTE_PAIRS      0x0000100
+#define SWAP_WORD_PAIRS      0x0000200
+#define SWAP_DWORD_PAIRS     0x0000400
 
 /******** Support functions *****************************/
 
@@ -299,6 +308,10 @@ void mmapReport(
         {
             printf("     Intr %s count: %llu, missed: %llu\n",
                 device->intrsource, device->intrcount, device->intrmissed);
+        }
+        if (level > 1)
+        {
+            printf("     Flags: %#x\n", device->flags);
         }
     }
 }
@@ -516,6 +529,27 @@ noDmaRead:
     if (mmapDebug) printf("mmapRead %s %s: normal transfer from %p to %p, 0x%"Z"x * %d bit\n",
         user, device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
     regDevCopy(dlen, nelem, src, pdata, NULL, 0);
+    if (device->flags & SWAP_DWORD_PAIRS && dlen >= 8)
+    {
+        epicsUInt64* p = pdata;
+        size_t i;
+        for (i = 0; i < nelem*(dlen/8); i++)
+            p[i] = p[i] >> 32 | p[i] << 32;
+    }
+    if (device->flags & SWAP_WORD_PAIRS && dlen >= 4)
+    {
+        epicsUInt32* p = pdata;
+        size_t i;
+        for (i = 0; i < nelem*(dlen/4); i++)
+            p[i] = p[i] >> 16 | p[i] << 16;
+    }
+    if (device->flags & SWAP_BYTE_PAIRS && dlen >= 2)
+    {
+        epicsUInt16* p = pdata;
+        size_t i;
+        for (i = 0; i < nelem*(dlen/2); i++)
+            p[i] = p[i] >> 8 | p[i] << 8;
+    }
     return 0;
 }
 
@@ -862,6 +896,15 @@ int mmapConfigure(
         int fd;
         unsigned long mapstart;
         size_t mapsize;
+        char* p;
+
+        if ((p = strchr(addrspace, '&')) != NULL)
+        {
+            *p++ = 0;
+            if (strcasecmp(p, "SwapDwordPairs") == 0) flags |= SWAP_DWORD_PAIRS;
+            if (strcasecmp(p, "SwapWordPairs") == 0) flags |= SWAP_WORD_PAIRS;
+            if (strcasecmp(p, "SwapBytePairs") == 0) flags |= SWAP_BYTE_PAIRS;
+        }
 
         if (mmapDebug) printf("mmapConfigure %s: mmap to %s\n",
             name, addrspace);

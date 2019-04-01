@@ -944,11 +944,11 @@ int mmapConfigure(
         {
             /* map shared with other processes read/write or readonly */
             if (mmapDebug) printf("mmapConfigure %s: mmap(NULL, %"Z"u, %s, MAP_SHARED, %d=%s, %ld)\n",
-                name, mapsize, (flags &= READONLY_DEVICE) ? "PROT_READ" : "PROT_READ|PROT_WRITE",
+                name, mapsize, (flags & READONLY_DEVICE) ? "PROT_READ" : "PROT_READ|PROT_WRITE",
                 fd, addrspace, mapstart);
 
             localbaseaddress = mmap(NULL, mapsize,
-                (flags &= READONLY_DEVICE) ? PROT_READ : PROT_READ|PROT_WRITE,
+                (flags & READONLY_DEVICE) ? PROT_READ : PROT_READ|PROT_WRITE,
                 MAP_SHARED, fd, mapstart);
             if (localbaseaddress == MAP_FAILED)
             {

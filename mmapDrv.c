@@ -372,8 +372,8 @@ void mmapReport(
         if (device->intrvector >= 0)
             printf(", intr %s\n", device->intrsource);
         else
-             printf(", no intr\n");
-        if (level > 0 && device->intrvector >= 0)
+             printf(", no default intr\n");
+        if (level > 0)
         {
             printf("     intr count: %llu, missed: %llu\n",
                 device->intrcount, device->intrmissed);
@@ -454,7 +454,7 @@ IOSCANPVT mmapGetInScanPvt(
         epicsMutexUnlock(mmapConnectInterruptLock);
     }
 #ifdef HAVE_UIO
-    if (intrlevel == INTR_UIO)
+    if (!intrlevel || intrlevel == INTR_UIO)
         info = mmapConnectUioInterrupt(device, intrvector);
     if (!info)
 #endif /* HAVE_UIO */

@@ -100,8 +100,6 @@ struct regDevice {
     int (*intrhandler)(regDevice *device);
     void* userdata;
     IOSCANPVT ioscanpvt;
-    unsigned long long intrcount;
-    unsigned long long intrmissed;
     unsigned int flags;
     char* devtype;
     char* addrspace;
@@ -128,7 +126,9 @@ typedef struct mmapIntrInfo {
     IOSCANPVT ioscanpvt;
     int intrvector;
     int intrlevel;
+    unsigned long long intrcount;
 #ifdef HAVE_UIO
+    unsigned long long intrmissed;
     int uiofd;
     char uioname[1];
 #endif
@@ -140,7 +140,7 @@ void mmapInterrupt(void *arg)
 {
     mmapIntrInfo *info = arg;
     regDevice *device = info->device;
-    device->intrcount++;
+    info->intrcount++;
     if (mmapDebug >= 2)
         printf("mmapInterrupt %s: vector %d %s count = %llu, %s\n",
             device->name, device->intrvector,
@@ -149,7 +149,7 @@ void mmapInterrupt(void *arg)
 #else
             "",
 #endif
-            device->intrcount,
+            info->intrcount,
             device->intrhandler ? "calling handler" : "no handler installed");
     if (device->intrhandler)
     {
@@ -185,10 +185,10 @@ void mmapUioInterruptThread(void* arg)
 
         if (lastnum && intrno != lastnum+1)
         {
-            device->intrmissed++;
+            info->intrmissed++;
             if (mmapDebug >= 1)
                 printf("mmapUioInterruptThread %s: missed %lld interrupts so far\n",
-                    device->name, device->intrmissed);
+                    device->name, info->intrmissed);
         }
         lastnum = intrno;
 
@@ -370,13 +370,27 @@ void mmapReport(
             printf("mmap %s (no map)", device->addrspace);
 
         if (device->intrvector >= 0)
-            printf(", intr %s\n", device->intrsource);
-        else
-             printf(", no default intr\n");
+            printf(" intr=%s", device->intrsource);
+        printf("\n");
         if (level > 0)
         {
-            printf("     intr count: %llu, missed: %llu\n",
-                device->intrcount, device->intrmissed);
+            mmapIntrInfo *info;
+            for(info = intrInfos; info; info = info->next)
+            {
+                if (info->device == device)
+                {
+#ifdef HAVE_UIO
+                    if (info->intrlevel == INTR_UIO)
+                        printf("    intr %d (%s) count: %llu, missed: %llu\n",
+                            info->intrvector, info->uioname,
+                            info->intrcount, info->intrmissed);
+                    else
+#endif
+                    printf("    intr %d level %d count: %llu\n",
+                            info->intrvector, info->intrlevel,
+                            info->intrcount);
+                }
+            }
         }
         if (level > 1)
         {
@@ -454,8 +468,7 @@ IOSCANPVT mmapGetInScanPvt(
         epicsMutexUnlock(mmapConnectInterruptLock);
     }
 #ifdef HAVE_UIO
-    if (!intrlevel || intrlevel == INTR_UIO)
-        info = mmapConnectUioInterrupt(device, intrvector);
+    info = mmapConnectUioInterrupt(device, intrvector);
     if (!info)
 #endif /* HAVE_UIO */
     if (intrlevel >= 1 && intrlevel <= 7)
@@ -503,13 +516,6 @@ int mmapRead(
     }
     if (!device->localbaseaddress)
     {
-/*
-        if (offset == 0)
-        {
-            regDevCopy(dlen, 1, device->intrcount, pdata, NULL, 0);
-            return 0;
-        }
-*/
         errlogSevPrintf(errlogMajor,
             "mmapRead %s: device without a map\n", user);
         return -1;

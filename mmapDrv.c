@@ -371,6 +371,16 @@ void mmapReport(
 
         if (device->intrvector >= 0)
             printf(" intr=%s", device->intrsource);
+        if (device->flags & ALLOW_BLOCK_TRANSFER)
+            printf(" block");
+        if (device->flags & READONLY_DEVICE)
+            printf(" ro");
+        if (device->flags & SWAP_BYTE_PAIRS)
+            printf(" sb");
+        if (device->flags & SWAP_WORD_PAIRS)
+            printf(" sw");
+        if (device->flags & SWAP_DWORD_PAIRS)
+            printf(" sd");
         printf("\n");
         if (level > 0)
         {
@@ -613,25 +623,25 @@ noDmaRead:
         printf("mmapRead %s %s: normal transfer from %p to %p, 0x%"Z"x * %d bit\n",
             user, device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
     regDevCopy(dlen, nelem, src, pdata, NULL, 0);
-    if (device->flags & SWAP_DWORD_PAIRS && dlen >= 8)
+    if (device->flags & SWAP_DWORD_PAIRS)
     {
         epicsUInt64* p = pdata;
         size_t i;
-        for (i = 0; i < nelem*(dlen/8); i++)
+        for (i = 0; i < nelem*dlen/8; i++)
             p[i] = p[i] >> 32 | p[i] << 32;
     }
-    if (device->flags & SWAP_WORD_PAIRS && dlen >= 4)
+    if (device->flags & SWAP_WORD_PAIRS)
     {
         epicsUInt32* p = pdata;
         size_t i;
-        for (i = 0; i < nelem*(dlen/4); i++)
+        for (i = 0; i < nelem*dlen/4; i++)
             p[i] = p[i] >> 16 | p[i] << 16;
     }
-    if (device->flags & SWAP_BYTE_PAIRS && dlen >= 2)
+    if (device->flags & SWAP_BYTE_PAIRS)
     {
         epicsUInt16* p = pdata;
         size_t i;
-        for (i = 0; i < nelem*(dlen/2); i++)
+        for (i = 0; i < nelem*dlen/2; i++)
             p[i] = p[i] >> 8 | p[i] << 8;
     }
     return 0;
@@ -825,8 +835,8 @@ int mmapConfigure(
 {
     regDevice* device;
     char* localbaseaddress = NULL;
-    int vmespace=-2;
-    int flags=0;
+    int vmespace = -2;
+    int flags = 0;
     char devtype[32] = "";
 #ifdef vxWorks
     char intrsource[12] = "";
@@ -867,6 +877,24 @@ int mmapConfigure(
         intrvector = -1;
     vmespace = addrspace;
 #else /* !vxWorks */
+    if (addrspace) {
+        char* thisflag;
+        char* nextflag;
+        nextflag = strchr(addrspace, '&');
+        if (nextflag) *nextflag++ = 0;
+        while (nextflag) {
+            thisflag = nextflag;
+            nextflag = strchr(thisflag, '&');
+            if (nextflag) *nextflag++ = 0;
+            if (strcasecmp(thisflag, "SwapDwordPairs") == 0) flags ^= SWAP_DWORD_PAIRS;
+            else if (strcasecmp(thisflag, "SwapWordPairs") == 0) flags ^= SWAP_WORD_PAIRS;
+            else if (strcasecmp(thisflag, "SwapBytePairs") == 0) flags ^= SWAP_BYTE_PAIRS;
+            else if (strcasecmp(thisflag, "SwapWords") == 0) flags ^= SWAP_BYTE_PAIRS;
+            else if (strcasecmp(thisflag, "SwapDWords") == 0) flags ^= SWAP_BYTE_PAIRS|SWAP_WORD_PAIRS;
+            else if (strcasecmp(thisflag, "SwapQWords") == 0) flags ^= SWAP_BYTE_PAIRS|SWAP_WORD_PAIRS|SWAP_DWORD_PAIRS;
+            else fprintf(stderr, "Unknown flag %s\n", thisflag);
+        }
+    }
     if (!intrsource || !intrsource[0])
     {
         intrsource = addrspace;
@@ -939,8 +967,8 @@ int mmapConfigure(
     if (size > 0) {
         if (vmespace > 0)
         {
-            flags=vmespace/100;
-            vmespace%=100;
+            flags |= vmespace/100;
+            vmespace %= 100;
             if (mmapDebug)
                 printf("mmapConfigure %s: vmespace = %d\n",
                     name, vmespace);
@@ -1011,15 +1039,6 @@ int mmapConfigure(
             int fd;
             unsigned long mapstart;
             size_t mapsize;
-            char* p;
-
-            if ((p = strchr(addrspace, '&')) != NULL)
-            {
-                *p++ = 0;
-                if (strcasecmp(p, "SwapDwordPairs") == 0) flags |= SWAP_DWORD_PAIRS;
-                if (strcasecmp(p, "SwapWordPairs") == 0) flags |= SWAP_WORD_PAIRS;
-                if (strcasecmp(p, "SwapBytePairs") == 0) flags |= SWAP_BYTE_PAIRS;
-            }
 
             if (mmapDebug)
                 printf("mmapConfigure %s: mmap to %s\n",

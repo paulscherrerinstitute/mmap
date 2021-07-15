@@ -1,7 +1,6 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -9,6 +8,7 @@
 #include <regDev.h>
 
 #ifdef __unix
+#include <unistd.h>
  #include <sys/mman.h>
  #include <sys/stat.h>
  #include <sys/sysmacros.h>
@@ -25,11 +25,11 @@
  #include <devLibVME.h>
  #include <epicsTypes.h>
  #include <epicsThread.h>
- #include <epicsExport.h>
  #include <epicsEvent.h>
  #include <epicsMutex.h>
  #include <epicsFindSymbol.h>
  #include <epicsStdioRedirect.h>
+ #include <epicsExport.h>
 #else /* 3.13 is vxWorks only */
  #include <sysLib.h>
  #include <intLib.h>
@@ -80,10 +80,12 @@ typedef unsigned long long epicsUInt64;
 #define O_CLOEXEC 0
 #endif /* O_CLOEXEC */
 
-#define MAGIC 2661166104U /* crc("mmap") */
+#ifndef __GNUC__
+#define __attribute__(x)
+#define strcasecmp strcmp
+#endif
 
-static char cvsid_mmapDrv[] __attribute__((unused)) =
-    "$Id: mmapDrv.c,v 1.18 2015/06/25 14:57:42 zimoch Exp $";
+#define MAGIC 2661166104U /* crc("mmap") */
 
 #define INTR_NONE  0
 #define INTR_UIO  -2
@@ -842,7 +844,9 @@ int mmapConfigure(
     char intrsource[12] = "";
 #else /* !vxWorks */
     int intrvector = -1;
+#ifdef HAVE_MMAP
     struct stat sb;
+#endif
     int missingIntrSevr = errlogFatal;
 #endif /* !vxWorks */
 
@@ -1231,6 +1235,7 @@ int mmapConfigure(
 }
 
 #ifndef EPICS_3_13
+epicsExportAddress(int, mmapDebug);
 
 #include <iocsh.h>
 static const iocshArg mmapConfigureArg0 = { "name", iocshArgString };

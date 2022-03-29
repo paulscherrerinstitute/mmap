@@ -924,10 +924,21 @@ int mmapConfigure(
                     name, intrsource);
             if (stat(intrsource, &sb) < 0)
             {
-                errlogSevPrintf(missingIntrSevr,
-                    "mmapConfigure %s: Can't read device type of %s: %s\n",
-                    name, intrsource, strerror(errno));
-                if (missingIntrSevr == errlogFatal) return errno;
+                if (missingIntrSevr == errlogFatal) {
+                    errlogSevPrintf(errlogFatal,
+                        "mmapConfigure %s: Can't read device type of %s: %s\n",
+                        name, intrsource, strerror(errno));
+                    return errno;
+                }
+            }
+            else if (!S_ISCHR(sb.st_mode))
+            {
+                if (missingIntrSevr == errlogFatal) {
+                    errlogSevPrintf(errlogFatal,
+                        "mmapConfigure %s: %s is not a device file. No interrupt support.\n",
+                        name, intrsource);
+                    return -1;
+                }
             }
             else if (!mmapDevTypeToStr(major(sb.st_rdev), intrdevtype))
             {

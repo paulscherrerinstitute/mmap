@@ -61,10 +61,7 @@ typedef unsigned long long epicsUInt64;
 /* Try to find dma support */
 #ifdef vxWorks
 #include <version.h>
-#ifndef _WRS_VXWORKS_MAJOR
-/* vxWorks 5 */
 #define HAVE_DMA
-#endif /* vxWorks 5 */
 #include <dmaLib.h>
 #include <semLib.h>
 #include <sysLib.h>
@@ -114,8 +111,10 @@ struct regDevice {
 int mmapDebug = 0;
 
 /* Device flags */
-#define ALLOW_BLOCK_TRANSFER 0x0000001
-#define READONLY_DEVICE      0x0000002
+#define ALLOW_DMA            0x0000001
+#define BLOCK_DEVICE         0x0000002
+#define MAP_DEVICE           0x0000004
+#define READONLY_DEVICE      0x0000080
 #define SWAP_BYTE_PAIRS      0x0000100
 #define SWAP_WORD_PAIRS      0x0000200
 #define SWAP_DWORD_PAIRS     0x0000400
@@ -373,8 +372,8 @@ void mmapReport(
 
         if (device->intrvector >= 0)
             printf(" intr=%s", device->intrsource);
-        if (device->flags & ALLOW_BLOCK_TRANSFER)
-            printf(" block");
+        if (device->flags & ALLOW_DMA)
+            printf(" dma");
         if (device->flags & READONLY_DEVICE)
             printf(" ro");
         if (device->flags & SWAP_BYTE_PAIRS)
@@ -534,10 +533,17 @@ int mmapRead(
     }
 
     src = device->localbaseaddress+offset;
+    if (pdata == src)
+    {
+        if (mmapDebug)
+            printf("mmapRead %s %s: direct map, no copy needed\n",
+                user, device->name);
+        return 0;
+    }
 #ifdef HAVE_DMA
-    /* Try block transfer for long arrays */
+    /* Try DMA for long arrays */
     if (nelem >= 1024 &&                          /* inefficient for short arrays */
-        (device->flags & ALLOW_BLOCK_TRANSFER) && /* card must be able to do block transfer */
+        (device->flags & ALLOW_DMA) &&            /* hardware must be able to do DMA */
         (((long)pdata|(long)src) & 0x7) == 0)     /* src and dst address must be multiple of 8 */
     {
         unsigned int addrMode;
@@ -559,7 +565,7 @@ int mmapRead(
                 goto noDmaRead;
         }
         if (mmapDebug)
-            printf("mmapRead %s %s: block transfer from %p to %p, 0x%"Z"x * %d bit\n",
+            printf("mmapRead %s %s: DMA transfer from %p to %p, 0x%"Z"x * %d bit\n",
                 user, device->name, device->localbaseaddress+offset, pdata, nelem, dlen*8);
         while (1)
         {
@@ -577,16 +583,16 @@ int mmapRead(
                 {
                     dmaRequestCancel(dmaHandle, TRUE);
                     errlogSevPrintf(errlogMajor,
-                        "mmapRead %s %s: block transfer timeout.\n",
+                        "mmapRead %s %s: DMA timeout.\n",
                             user, device->name);
                     return -1;
                 }
 #endif /* !dmaTransferRequest_can_wait */
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
-                    /* try again with a slower block transfer speed */
+                    /* try again with a slower DMA speed */
                     if (mmapDebug)
-                        printf("mmapRead %s %s: block transfer mode %s failed. trying slower speed\n",
+                        printf("mmapRead %s %s: DMA mode %s failed. Trying slower speed\n",
                             user, device->name, dmaModeStr[device->maxDmaSpeed]);
                     device->maxDmaSpeed--;
                     continue;
@@ -613,7 +619,7 @@ int mmapRead(
                    * unaligned access (already checked before)
                 */
                 if (mmapDebug)
-                    printf("mmapRead %s %s: block transfer mode %s failed\n",
+                    printf("mmapRead %s %s: DMA mode %s failed\n",
                         user, device->name, dmaModeStr[device->maxDmaSpeed]);
                 break;
             }
@@ -682,11 +688,18 @@ int mmapWrite(
     }
 
     dst = device->localbaseaddress+offset;
+    if (pdata == dst)
+    {
+        if (mmapDebug)
+            printf("mmapWrite %s %s: direct map, no copy needed\n",
+                user, device->name);
+        return 0;
+    }
 #ifdef HAVE_DMA
-    /* Try block transfer for long arrays */
-    if (pmask == NULL &&                           /* cannot use read-modify-write with DMA */
+    /* Try DMA for long arrays */
+    if (pmask == NULL &&                          /* cannot use read-modify-write with DMA */
         nelem >= 1024 &&                          /* inefficient for short arrays */
-        (device->flags & ALLOW_BLOCK_TRANSFER) && /* card must be able to do block transfer */
+        (device->flags & ALLOW_DMA) &&            /* hardware must be able to do DMA */
         (((long)pdata|(long)dst) & 0x7) == 0)     /* src and dst address must be multiple of 8 */
     {
         unsigned int addrMode;
@@ -708,7 +721,7 @@ int mmapWrite(
                 goto noDmaWrite;
         }
         if (mmapDebug)
-            printf("mmapWrite %s %s: block transfer from %p to %p, 0x%"Z"x * %d bit\n",
+            printf("mmapWrite %s %s: DMA transfer from %p to %p, 0x%"Z"x * %d bit\n",
                 user, device->name, pdata, device->localbaseaddress+offset, nelem, dlen*8);
         while (1)
         {
@@ -726,16 +739,16 @@ int mmapWrite(
                 {
                     dmaRequestCancel(dmaHandle, TRUE);
                     errlogSevPrintf(errlogMajor,
-                        "mmapWrite %s %s: block transfer transfer timeout.\n",
+                        "mmapWrite %s %s: DMA timeout.\n",
                             user, device->name);
                     return -1;
                 }
 #endif /* !dmaTransferRequest_can_wait */
                 if (dmaStatus == DMA_BUSERR && dlen == 8 && device->maxDmaSpeed > 0)
                 {
-                    /* try again with a slower block transfer speed */
+                    /* try again with a slower DMA speed */
                     if (mmapDebug)
-                        printf("mmapWrite %s %s: block transfer mode %s failed. trying slower speed\n",
+                        printf("mmapWrite %s %s: DMA mode %s failed. Trying slower speed\n",
                             user, device->name, dmaModeStr[device->maxDmaSpeed]);
                     device->maxDmaSpeed--;
                     continue;
@@ -762,7 +775,7 @@ int mmapWrite(
                    * unaligned access (already checked before)
                 */
                 if (mmapDebug)
-                    printf("mmapWrite %s %s: block transfer mode %s failed\n",
+                    printf("mmapWrite %s %s: DMA mode %s failed\n",
                         user, device->name, dmaModeStr[device->maxDmaSpeed]);
                 break;
             }
@@ -853,7 +866,7 @@ int mmapConfigure(
     if (name == NULL)
     {
         printf("usage: mmapConfigure(\"name\", baseaddress, size, addrspace, intrvector, ilvl)\n");
-        printf("maps register block to device \"name\"\n");
+        printf("maps register/memory block to device \"name\"\n");
         printf("\"name\" must be a unique string on this IOC\n");
 #ifdef HAVE_MMAP
         printf("addrspace: device used for mapping (default: /dev/mem)\n");
@@ -864,8 +877,9 @@ int mmapConfigure(
         printf("addrspace = csr, 16, 24 or 32: VME address space"
 #endif /* !vxWorks */
 #ifdef HAVE_DMA
-                " (+100: allow block transfer)"
+                " (+100: allow DMA for large arrays)"
 #endif /* HAVE_DMA */
+                " (+200: enable regDev block mode)"
                 "\n");
         printf("addrspace = sim: simulation on allocated memory\n");
         return 0;
@@ -888,7 +902,7 @@ int mmapConfigure(
         if (nextflag) *nextflag++ = 0;
         while (nextflag) {
             thisflag = nextflag;
-            nextflag = strchr(thisflag, '&');
+            nextflag = strpbrk(thisflag, "&|,;+ ");
             if (nextflag) *nextflag++ = 0;
             if (strcasecmp(thisflag, "SwapDwordPairs") == 0) flags ^= SWAP_DWORD_PAIRS;
             else if (strcasecmp(thisflag, "SwapWordPairs") == 0) flags ^= SWAP_WORD_PAIRS;
@@ -896,6 +910,11 @@ int mmapConfigure(
             else if (strcasecmp(thisflag, "SwapWords") == 0) flags ^= SWAP_BYTE_PAIRS;
             else if (strcasecmp(thisflag, "SwapDWords") == 0) flags ^= SWAP_BYTE_PAIRS|SWAP_WORD_PAIRS;
             else if (strcasecmp(thisflag, "SwapQWords") == 0) flags ^= SWAP_BYTE_PAIRS|SWAP_WORD_PAIRS|SWAP_DWORD_PAIRS;
+#ifdef HAVE_DMA
+            else if (strcasecmp(thisflag, "dma") == 0) flags |= ALLOW_DMA;
+#endif
+            else if (strcasecmp(thisflag, "block") == 0) flags |= BLOCK_DEVICE;
+            else if (strcasecmp(thisflag, "map") == 0) flags |= MAP_DEVICE|BLOCK_DEVICE;
             else fprintf(stderr, "Unknown flag %s\n", thisflag);
         }
     }
@@ -1167,6 +1186,14 @@ int mmapConfigure(
         }
     #endif /* HAVE_MMAP */
     }
+
+    if ((flags & MAP_DEVICE) && (flags & (MAP_DEVICE|SWAP_BYTE_PAIRS|SWAP_WORD_PAIRS|SWAP_DWORD_PAIRS)))
+    {
+        errlogSevPrintf(errlogFatal,
+            "mmapConfigure %s: Swapping is incompatible with mapping\n", name);
+        return -1;
+    }
+
     device = (regDevice*)calloc(sizeof(regDevice),1);
     if (device == NULL)
     {
@@ -1217,6 +1244,12 @@ int mmapConfigure(
         printf("mmapConfigure %s: vmespace = %d addrspace = %s\n",
             name, vmespace, device->addrspace);
 
+    regDevRegisterDevice(name, &mmapSupport, device, size);
+#ifdef HAVE_dmaAlloc
+    if (vmespace > 0)
+        regDevRegisterDmaAlloc(device, mmapDmaAlloc);
+#endif /* HAVE_dmaAlloc */
+
 #ifdef HAVE_DMA
     device->maxDmaSpeed=-1;
     if (vmespace > 0)
@@ -1233,15 +1266,17 @@ int mmapConfigure(
                 break;
             }
         }
+        localbaseaddress = NULL; /* no direct map when doing DMA */
     }
     device->dmaComplete = epicsEventMustCreate(epicsEventEmpty);
 #endif /* HAVE_DMA */
 
-    regDevRegisterDevice(name, &mmapSupport, device, size);
-#ifdef HAVE_dmaAlloc
-    if (vmespace > 0)
-        regDevRegisterDmaAlloc(device, mmapDmaAlloc);
-#endif /* HAVE_dmaAlloc */
+    if (flags & BLOCK_DEVICE)
+    {
+        if (!(flags & MAP_DEVICE))
+            localbaseaddress = NULL;
+        regDevMakeBlockdevice(device, REGDEV_BLOCK_READ | REGDEV_BLOCK_WRITE, REGDEV_NO_SWAP, localbaseaddress);
+    }
     return 0;
 }
 
@@ -1253,10 +1288,10 @@ static const iocshArg mmapConfigureArg0 = { "name", iocshArgString };
 static const iocshArg mmapConfigureArg1 = { "baseaddress", iocshArgInt };
 static const iocshArg mmapConfigureArg2 = { "size", iocshArgInt };
 #ifdef vxWorks
-static const iocshArg mmapConfigureArg3 = { "addrspace (-1=simulation; 0xc=CSR; 16,24,32=VME,+100=block transfer)", iocshArgInt };
+static const iocshArg mmapConfigureArg3 = { "addrspace (-1=simulation; 0xc=CSR; 16,24,32=VME,+100=dma,+200=blockDevice)", iocshArgInt };
 static const iocshArg mmapConfigureArg4 = { "intrvector", iocshArgInt };
 #else /* !vxWorks */
-static const iocshArg mmapConfigureArg3 = { "mapped device (sim=simulation; csr,16,24,32=VME; default:/dev/mem)", iocshArgString };
+static const iocshArg mmapConfigureArg3 = { "mapped device (default:/dev/mem, sim=simulation; csr,16,24,32=VME; &option)", iocshArgString };
 static const iocshArg mmapConfigureArg4 = { "intrsource", iocshArgString };
 #endif /* !vxWorks */
 static const iocshArg mmapConfigureArg5 = { "intrlevel", iocshArgInt };

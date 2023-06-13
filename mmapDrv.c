@@ -890,7 +890,7 @@ int mmapConfigure(
 
 #ifdef vxWorks
     if (intrvector > 0 && intrvector < 256)
-        sprintf("vme vec %i", intrsource, intrvector);
+        sprintf(intrsource, "vme vec %i", intrvector);
     else
         intrvector = -1;
     vmespace = addrspace;

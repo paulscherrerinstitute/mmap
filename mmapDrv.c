@@ -305,57 +305,75 @@ mmapIntrInfo *mmapConnectVmeInterrupt(const char* user, regDevice *device, int i
 {
     mmapIntrInfo *info;
 
-    if (mmapDebug)
-        printf("mmapConnectVmeInterrupt %s %s: intrvector = %d intrlevel = %d\n",
-            user, device->name, intrvector, intrlevel);
-
-    if (intrvector >= 256)
+    if (intrvector > 0xff)
     {
-        errlogSevPrintf(errlogFatal,
-            "mmapConnectVmeInterrupt %s %s: Invalid VME interrupt vector number %i.\n",
-            user, device->name, intrvector);
-        return NULL;
+        intrlevel = intrvector >> 8;
+        intrvector &= 0xff;
     }
 
-    if (intrlevel < 1 || intrlevel > 7)
+    if (mmapDebug)
+        printf("mmapConnectVmeInterrupt %s %s: intrvector=%#x intrlevel = %d\n",
+            user, device->name, intrvector, intrlevel);
+
+    if (!intrlevel)
+    {
+        errlogSevPrintf(errlogMajor,
+            "mmapConnectVmeInterrupt %s %s: Warning: No VME interrupt level given. Interrupts for vector %#x may not be enabled.\n",
+            user, device->name, intrvector);
+    }
+    else if (intrlevel < 1 || intrlevel > 7)
     {
         errlogSevPrintf(errlogFatal,
-            "mmapConnectVmeInterrupt %s %s: Invalid VME interrupt level number %i.\n",
+            "mmapConnectVmeInterrupt %s %s: Invalid VME interrupt level %i.\n",
+            user, device->name, intrlevel);
+        return NULL;
+    }
+    if (intrvector < 1 || intrlevel > 255)
+    {
+        errlogSevPrintf(errlogFatal,
+            "mmapConnectVmeInterrupt %s %s: Invalid VME interrupt vector %#x.\n",
             user, device->name, intrlevel);
         return NULL;
     }
 
     info = calloc(sizeof(mmapIntrInfo), 1);
-    if (info)
-    {
-        info->device = device;
-        info->intrlevel = intrlevel;
-        info->intrvector = intrvector;
-        scanIoInit(&info->ioscanpvt);
-        if (info->ioscanpvt)
-        {
-            if (devConnectInterrupt(intVME, intrvector, mmapInterrupt, info) != 0)
-            {
-                errlogSevPrintf(errlogFatal,
-                    "mmapConfigure %s %s: Cannot connect to interrupt vector %d.\n",
-                    user, device->name, intrvector);
-                free(info);
-                return NULL;
-            }
-            if (devEnableInterruptLevel(intVME, intrlevel) != 0)
-            {
-                errlogSevPrintf(errlogMajor,
-                    "mmapConfigure %s %s: Cannot enable interrupt level %d.\n",
-                    user, device->name, intrlevel);
-            }
-            return info;
-        }
-        free(info);
+    if (!info) {
+        errlogSevPrintf(errlogFatal,
+            "mmapConnectUioInterrupt %s %s: Out of memory.\n",
+            user, device->name);
+        return NULL;
     }
-    errlogSevPrintf(errlogFatal,
-        "mmapConnectUioInterrupt %s %s: Cannot initialize interrupts: %s\n",
-        user, device->name, strerror(errno));
-    return NULL;
+
+    info->device = device;
+    info->intrlevel = intrlevel;
+    info->intrvector = intrvector;
+    scanIoInit(&info->ioscanpvt);
+
+    if (!info->ioscanpvt)
+    {
+        errlogSevPrintf(errlogFatal,
+            "mmapConnectVmeInterrupt %s %s: scanIoInit failed: %s\n",
+            user, device->name, strerror(errno));
+        free(info);
+        return NULL;
+    }
+
+    if (devConnectInterrupt(intVME, intrvector, mmapInterrupt, info) != 0)
+    {
+        errlogSevPrintf(errlogFatal,
+            "mmapConnectVmeInterrupt %s %s: Cannot connect to VME interrupt vector %#x.\n",
+            user, device->name, intrvector);
+        free(info);
+        return NULL;
+    }
+
+    if (intrlevel && devEnableInterruptLevel(intVME, intrlevel) != 0)
+    {
+        errlogSevPrintf(errlogMajor,
+            "mmapConnectVmeInterrupt %s %s: Warning: Cannot enable VME interrupt level %d.\n",
+            user, device->name, intrlevel);
+    }
+    return info;
 }
 
 void mmapReport(
@@ -455,8 +473,8 @@ IOSCANPVT mmapGetInScanPvt(
         return NULL;
     }
     if (mmapDebug)
-        printf("mmapGetInScanPvt %s: %s devtype=%s intrvector=%i default-intrvector=%d intrlevel=%d default-intrsource=%s\n",
-            user, device->name, device->devtype, intrvector, device->intrvector, intrlevel, device->intrsource);
+        printf("mmapGetInScanPvt %s: %s devtype=%s intrvector=%d=%#x default-intrvector=%d intrlevel=%d default-intrsource=%s\n",
+            user, device->name, device->devtype, intrvector, intrvector, device->intrvector, intrlevel, device->intrsource);
 
     if (intrvector < 0)
     {
@@ -856,7 +874,7 @@ int mmapConfigure(
     int flags = 0;
     char devtype[32] = "";
 #ifdef vxWorks
-    char intrsource[12] = "";
+    char intrsource[32] = "";
 #else /* !vxWorks */
     int intrvector = -1;
 #ifdef HAVE_MMAP
@@ -892,7 +910,7 @@ int mmapConfigure(
 
 #ifdef vxWorks
     if (intrvector > 0 && intrvector < 256)
-        sprintf(intrsource, "vme vec %i", intrvector);
+        sprintf(intrsource, "VME vector %x level %i", intrvector, intrlevel);
     else
         intrvector = -1;
     vmespace = addrspace;
@@ -1029,6 +1047,7 @@ int mmapConfigure(
                         name, addrspace);
                     return -1;
             }
+            strcat(devtype, "VME");
 #ifndef EPICS_3_13
             if (!pdevLibVirtualOS)
             {
@@ -1211,7 +1230,11 @@ int mmapConfigure(
     device->vmespace = vmespace;
     device->baseaddress = baseaddress;
     device->localbaseaddress = localbaseaddress;
-    device->intrsource = intrsource && intrsource[0] ? strdup(intrsource) : NULL;
+    device->intrsource =
+#ifndef vxWorks
+            intrsource &&
+#endif
+            intrsource[0] ? strdup(intrsource) : NULL;
     device->intrvector = intrvector;
     device->intrlevel = intrlevel;
     device->intrhandler = intrhandler;
